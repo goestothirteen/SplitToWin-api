@@ -12,7 +12,11 @@ from collections import defaultdict, deque
 from flask import Blueprint, current_app, jsonify, request
 
 from .config import Config
-from .services.receipt_parser import ReceiptParseError, parse_receipt_image
+from .services.receipt_parser import (
+    ReceiptParseError,
+    active_providers,
+    parse_receipt_image,
+)
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +60,7 @@ def healthz():
             {
                 "status": "ok" if not missing else "degraded",
                 "missingConfig": missing,
-                "model": Config.GEMINI_MODEL,
+                "providers": active_providers(),
             }
         ),
         200 if not missing else 503,

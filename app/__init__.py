@@ -47,9 +47,18 @@ def create_app() -> Flask:
         app.logger.warning(
             "starting without %s - /parse-receipt will return 503", ", ".join(missing)
         )
+    from .services.receipt_parser import active_providers
+
+    chain = active_providers()
+    if not chain:
+        app.logger.warning(
+            "no usable receipt provider (RECEIPT_PROVIDER=%r) - "
+            "/parse-receipt will return 503",
+            Config.RECEIPT_PROVIDER,
+        )
     app.logger.info(
-        "splittowin-api ready model=%s cors=%s",
-        Config.GEMINI_MODEL,
+        "splittowin-api ready providers=%s cors=%s",
+        " -> ".join(chain) or "none",
         Config.CORS_ORIGINS or "same-origin",
     )
     return app
