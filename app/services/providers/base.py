@@ -80,7 +80,20 @@ You read restaurant receipts and return structured data. Rules:
 - Sub-items printed under a set or combo with no price of their own are not
   separate lines. Fold their names into the parent, e.g.
   "Cocktail Party for 2 (Pineapple Rum, Ume Dream)".
-- Receipts may be in any language. Keep item names in the language printed.
+- Always write `name` in English, whatever language the receipt is in. This is
+  read at the table by people splitting a bill, so it has to be scannable.
+  - Translate non-English names. Never return the original script, and never
+    return a mix of both: "Salted egg chicken rice", not
+    "咸蛋鸡丁饭 Creamy Salted Egg Chicken Rice".
+  - Many receipts print the same dish twice, once per language. That is one
+    line, not two.
+  - Keep it to a few plain words describing the dish. Expand abbreviations and
+    kitchen shorthand into something a diner would recognise: "Hor Fun w/ egg"
+    becomes "Flat rice noodles with egg", "Kopi O" becomes "Black coffee".
+  - Keep a restaurant's own name for a dish if it has no plain equivalent, but
+    still write it in Latin script.
+  - Modifiers priced on their own line stay their own line, named in relation
+    to what they modify: "Extra rice", "Less ice".
 - If a price is smudged or unreadable, use 0 rather than guessing.
 - `subtotal` is the pre-charge total; `total` is the grand total as printed.
 """
