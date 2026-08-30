@@ -23,10 +23,20 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 
 from .base import PROMPT, SYSTEM_INSTRUCTION, ProviderError, log
 
 NAME = "claude_code"
+
+# Every call spawns a Node process of a few hundred MB. gunicorn runs 2 workers
+# x 4 threads, so without a cap a handful of simultaneous receipts would invoke
+# the OOM killer on a 2GB box shared with two other apps. One at a time by
+# default; anything that cannot get a slot quickly is reported as transient,
+# which makes the request fail over to the fallback provider instead of queuing
+# behind a 12s call or dying.
+_SLOTS = threading.BoundedSemaphore(int(os.environ.get("CLAUDE_MAX_CONCURRENT", "1")))
+_SLOT_WAIT_S = float(os.environ.get("CLAUDE_SLOT_WAIT_S", "3"))
 
 # Read is the only tool it needs — the image is a file on disk. Everything
 # else (Bash, Write, Edit, WebFetch, ...) stays unavailable.
@@ -49,7 +59,16 @@ _TRANSIENT_MARKERS = (
 
 
 def available() -> bool:
-    return shutil.which(_binary()) is not None
+    """Usable only if the CLI exists AND it has a login to use.
+
+    Checking both matters: without the credential check the provider looks
+    available, then fails on every single request, instead of being skipped
+    so the fallback takes over cleanly.
+    """
+    if shutil.which(_binary()) is None:
+        return False
+    home = os.environ.get("HOME", "")
+    return bool(home) and os.path.isdir(os.path.join(home, ".claude"))
 
 
 def _binary() -> str:
@@ -83,6 +102,19 @@ def _extract_json(text: str) -> dict:
 
 
 def parse(image_bytes: bytes, mime_type: str, timeout_s: int) -> dict:
+    if not _SLOTS.acquire(timeout=_SLOT_WAIT_S):
+        log.info("claude_code is busy; deferring to the fallback provider")
+        raise ProviderError(
+            "The receipt reader is busy right now. Try again in a moment.",
+            transient=True,
+        )
+    try:
+        return _parse(image_bytes, mime_type, timeout_s)
+    finally:
+        _SLOTS.release()
+
+
+def _parse(image_bytes: bytes, mime_type: str, timeout_s: int) -> dict:
     suffix = {"image/png": ".png", "image/webp": ".webp"}.get(mime_type, ".jpg")
 
     # A fresh directory per request: it is the only place the agent can reach,
