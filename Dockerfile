@@ -12,11 +12,13 @@ ENV PYTHONUNBUFFERED=1 \
 # --- Node + the Claude Code CLI -------------------------------------------
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# npm creates the `claude` bin symlink itself from the package's own bin
+# entry. Pointing one at a guessed filename produced a dangling link, so let
+# npm do it and assert the result here rather than at the first request.
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force \
-    && ln -sf /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude \
-    && chmod +x /usr/local/bin/claude
+    && claude --version
 
 WORKDIR /app
 
