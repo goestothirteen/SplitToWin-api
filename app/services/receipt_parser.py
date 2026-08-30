@@ -12,6 +12,7 @@ Anthropic API) is a change to this file and nothing else.
 import io
 import json
 import logging
+import time
 from dataclasses import dataclass
 
 from google import genai
@@ -23,6 +24,19 @@ from ..config import Config
 log = logging.getLogger(__name__)
 
 SUPPORTED_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Worth retrying: upstream congestion, rate limits, timeouts, and 5xx."""
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if status in {429, 500, 502, 503, 504}:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        marker in text
+        for marker in ("unavailable", "timeout", "timed out", "deadline", "overloaded",
+                       "resource_exhausted", "503", "429", "connection")
+    )
 
 
 class ReceiptParseError(Exception):
@@ -243,27 +257,48 @@ def parse_receipt_image(raw: bytes, mime_type: str) -> ParsedReceipt:
     image_bytes, image_mime = normalise_image(raw)
     client = _get_client()
 
-    try:
-        response = client.models.generate_content(
-            model=Config.GEMINI_MODEL,
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type=image_mime),
-                PROMPT,
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                response_mime_type="application/json",
-                response_schema=RECEIPT_SCHEMA,
-                temperature=0,
-            ),
-        )
-    except Exception as exc:
-        # Upstream failures are logged with detail but reported generically —
-        # the client has no use for provider internals.
-        log.exception("receipt model call failed")
-        raise ReceiptParseError(
-            "Couldn't reach the receipt reader. Try again in a moment."
-        ) from exc
+    part = types.Part.from_bytes(data=image_bytes, mime_type=image_mime)
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=RECEIPT_SCHEMA,
+        temperature=0,
+    )
+
+    # The free tier returns 503 UNAVAILABLE under load often enough to see it
+    # in a handful of test calls. One of those used to be a failed receipt at
+    # the table, so retry transient upstream errors — but against a wall-clock
+    # deadline, so retries can never outlast the gunicorn worker timeout.
+    deadline = time.monotonic() + Config.GEMINI_DEADLINE_S
+    backoff = 1.0
+    last_exc: Exception | None = None
+
+    for attempt in range(1, Config.GEMINI_MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=Config.GEMINI_MODEL, contents=[part, PROMPT], config=config
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient(exc):
+                log.exception("receipt model call failed permanently")
+                raise ReceiptParseError(
+                    "Couldn't reach the receipt reader. Try again in a moment."
+                ) from exc
+            remaining = deadline - time.monotonic()
+            if attempt >= Config.GEMINI_MAX_ATTEMPTS or remaining <= backoff:
+                log.warning(
+                    "model unavailable after %d attempt(s): %s", attempt, exc
+                )
+                raise ReceiptParseError(
+                    "The receipt reader is busy right now. Try again in a moment."
+                ) from exc
+            log.info("attempt %d hit a transient error, retrying: %s", attempt, exc)
+            time.sleep(backoff)
+            backoff *= 2
+    else:  # pragma: no cover - loop always breaks or raises
+        raise ReceiptParseError("Couldn't reach the receipt reader.") from last_exc
 
     text = (response.text or "").strip()
     if not text:

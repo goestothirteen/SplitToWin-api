@@ -27,6 +27,12 @@ class Config:
     # and the client sees a 502 instead of a useful error.
     GEMINI_TIMEOUT_S = _int("GEMINI_TIMEOUT_S", 45)
 
+    # Retries against transient upstream errors. The deadline bounds all
+    # attempts together so a retry storm can never outlive the gunicorn
+    # worker timeout and turn a slow parse into a 502.
+    GEMINI_MAX_ATTEMPTS = _int("GEMINI_MAX_ATTEMPTS", 3)
+    GEMINI_DEADLINE_S = _int("GEMINI_DEADLINE_S", 55)
+
     # Receipt photos from phones are 3-12 MB. Anything past this is not a
     # receipt, and refusing it early keeps someone from burning the quota.
     MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 12 * 1024 * 1024)
