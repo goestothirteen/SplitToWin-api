@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from flask import Blueprint, current_app, jsonify, request
 
 from .config import Config
+from .services.jobs import cache as job_cache
 from .services.receipt_parser import (
     ReceiptParseError,
     active_providers,
@@ -108,6 +109,39 @@ def parse_receipt():
         return jsonify({"error": "That file was empty.", "code": "empty"}), 400
 
     started = time.monotonic()
+
+    # Phones drop the connection when backgrounded, so the client retries with
+    # the same job id. Reusing the result means a retry costs nothing and
+    # returns instantly, instead of parsing the same receipt twice.
+    job_id = (request.form.get("jobId") or "").strip()[:64]
+
+    if job_id:
+        is_owner, entry = job_cache.claim(job_id)
+        if not is_owner:
+            if entry.result is not None:
+                log.info("job %s already parsed, serving cached result", job_id)
+                return jsonify(entry.result)
+            # Someone else is mid-parse: wait for them rather than starting a
+            # second one. The wait is bounded well under the worker timeout.
+            log.info("job %s already in flight, waiting", job_id)
+            result, error, timed_out = job_cache.wait(entry, Config.PARSE_DEADLINE_S)
+            if timed_out:
+                return (
+                    jsonify(
+                        {
+                            "error": "Still reading that receipt. Try again in a moment.",
+                            "code": "in_progress",
+                        }
+                    ),
+                    503,
+                )
+            if error is not None:
+                return (
+                    jsonify({"error": str(error), "code": "parse_failed"}),
+                    getattr(error, "status", 502),
+                )
+            return jsonify(result)
+
     try:
         parsed = parse_receipt_image(raw, upload.mimetype or "image/jpeg")
     except ReceiptParseError as exc:
@@ -117,15 +151,22 @@ def parse_receipt():
             exc.message,
             len(raw),
         )
+        if job_id:
+            job_cache.finish(job_id, None, exc)
         return jsonify({"error": exc.message, "code": "parse_failed"}), exc.status
 
+    payload = parsed.to_dict()
+    if job_id:
+        job_cache.finish(job_id, payload, None)
+
     log.info(
-        "parsed receipt items=%d bytes=%d ms=%d",
+        "parsed receipt items=%d bytes=%d ms=%d job=%s",
         len(parsed.items),
         len(raw),
         int((time.monotonic() - started) * 1000),
+        job_id or "-",
     )
-    return jsonify(parsed.to_dict())
+    return jsonify(payload)
 
 
 @api.app_errorhandler(413)
