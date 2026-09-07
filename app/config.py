@@ -62,6 +62,16 @@ class Config:
     RATE_LIMIT_PER_HOUR = _int("RATE_LIMIT_PER_HOUR", 60)
     LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
+    # Caddy's JSON access log, mounted read-only by compose. /stats is built
+    # from it. The glob must catch Caddy's rotations too, which are named
+    # `split2win-<timestamp>.log.gz`, not `split2win.log.1`.
+    ACCESS_LOG_GLOB = os.environ.get(
+        "ACCESS_LOG_GLOB", "/var/log/caddy/split2win*.log*"
+    ).strip()
+    # /stats is an open URL, so this is what stops a scanner making the box
+    # re-read the log for every hit.
+    STATS_CACHE_S = _int("STATS_CACHE_S", 30)
+
     @classmethod
     def missing(cls) -> list[str]:
         """Config problems that make receipt parsing impossible."""

@@ -18,6 +18,7 @@ from .services.receipt_parser import (
     active_providers,
     parse_receipt_image,
 )
+from .services.stats import access_log_report, render_html
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,21 @@ def healthz():
         ),
         200 if not missing else 503,
     )
+
+
+@api.get("/stats")
+def stats():
+    """Who has used the app: one row per person who parsed a receipt.
+
+    Deliberately an open URL. The report is counts and device classes only —
+    no addresses — so there is nothing on it worth the friction of a login.
+    A browser gets a table; curl and scripts get the JSON it was built from.
+    """
+    report = access_log_report(Config.ACCESS_LOG_GLOB, Config.STATS_CACHE_S)
+    wants = request.accept_mimetypes.best_match(["application/json", "text/html"])
+    if wants == "text/html":
+        return render_html(report), 200, {"Content-Type": "text/html; charset=utf-8"}
+    return jsonify(report)
 
 
 @api.post("/parse-receipt")
