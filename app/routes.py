@@ -71,11 +71,12 @@ def healthz():
 
 @api.get("/stats")
 def stats():
-    """Who has used the app: one row per person who parsed a receipt.
+    """How the app has been used: one row per receipt uploaded.
 
-    Deliberately an open URL. The report is counts and device classes only —
-    no addresses — so there is nothing on it worth the friction of a login.
-    A browser gets a table; curl and scripts get the JSON it was built from.
+    Deliberately an open URL. A row is counts, a device class and a visitor
+    number — no addresses, and nothing off the receipt itself, which never
+    reaches the server — so there is nothing on it worth the friction of a
+    login. A browser gets a table; curl and scripts get the JSON behind it.
     """
     report = access_log_report(Config.ACCESS_LOG_GLOB, Config.STATS_CACHE_S)
     wants = request.accept_mimetypes.best_match(["application/json", "text/html"])

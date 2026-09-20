@@ -1,15 +1,17 @@
-"""Who has used the app, one row per person — read off Caddy's access log.
+"""Every receipt upload, one row each — read off Caddy's access log.
 
 The API stores nothing, so the only record of use is the JSON access log the
-edge proxy writes, which compose mounts read-only into this container. A
-"person" here is an address plus a device class, which is as close as HTTP
-metadata gets; a row is only made for someone who actually submitted a
-receipt, because loading the page and leaving is not using the app.
+edge proxy writes, which compose mounts read-only into this container. A row
+here is one submitted receipt photo, successful or not; loading the page and
+leaving is not using the app, so that is a headline count instead.
 
-Only aggregates leave this module. Addresses are needed to tell visitors
-apart but are never returned, which is what lets /stats be an open URL:
-there is nothing on it worth guarding with a login. Names, items and
-assignments never reach the server at all, so they cannot be here either.
+What a row can say is bounded by what the log knows. The receipt itself —
+merchant, items, totals, who owes what — never reaches the server, and pay
+link payloads are blanked by the log filter before they are written, so the
+detail per upload is when, from what kind of device, how it ended, how long
+it took and how big the photo was. Addresses are read only to tell visitors
+apart and are never returned, which is what lets /stats be an open URL:
+there is nothing on it worth guarding with a login.
 """
 
 import glob
@@ -39,6 +41,17 @@ BOT_MARKERS = (
     "nmap",
 )
 
+# What the status code meant to the person holding the phone. Anything not
+# listed is shown as the bare code rather than guessed at.
+OUTCOMES = {
+    200: "parsed",
+    400: "bad upload",
+    413: "photo too large",
+    429: "rate limited",
+    502: "parse failed",
+    503: "still parsing",
+}
+
 
 def device_label(user_agent: str) -> str:
     ua = (user_agent or "").lower()
@@ -65,14 +78,34 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, SGT).isoformat(timespec="seconds")
 
 
+def _upload_kb(entry: dict, req: dict):
+    """How big the photo was. Caddy records the request body it read; a line
+    without that field may still carry the length the phone declared."""
+    size = entry.get("bytes_read")
+    if size is None:
+        header = (req.get("headers", {}).get("Content-Length") or [None])[0]
+        try:
+            size = int(header)
+        except (TypeError, ValueError):
+            return None
+    return round(size / 1024) or None
+
+
 def summarise(paths) -> dict:
     """Fold every log line in `paths` into the report. Pure: no caching, no IO
     beyond reading the files given, so tests can hand it a temp directory."""
-    visitors: "OrderedDict[tuple, dict]" = OrderedDict()
+    # Visitors exist only to number the rows, so a returning phone is visible
+    # without an address ever leaving. Insertion order is first-appearance
+    # order, which keeps a number attached to the same person as the log grows.
+    visitors: "OrderedDict[tuple, int]" = OrderedDict()
+    uploads = []
     totals = {
         "requests": 0,
         "visitors": 0,
+        "uploads": 0,
         "receiptsParsed": 0,
+        "failedParses": 0,
+        "pageViews": 0,
         "payLinkOpens": 0,
         "botHits": 0,
     }
@@ -96,72 +129,46 @@ def summarise(paths) -> dict:
                 continue
 
             ip = req.get("client_ip") or req.get("remote_ip") or "?"
-            row = visitors.get((ip, device))
-            if row is None:
-                row = visitors[(ip, device)] = {
-                    "device": device,
-                    "firstSeen": ts,
-                    "lastSeen": ts,
-                    "pageViews": 0,
-                    "receipts": 0,
-                    "failedParses": 0,
-                    "_parseSeconds": 0.0,
-                }
-            row["firstSeen"] = min(row["firstSeen"], ts)
-            row["lastSeen"] = max(row["lastSeen"], ts)
+            key = (ip, device)
+            if key not in visitors:
+                visitors[key] = len(visitors) + 1
 
             path_only = (req.get("uri") or "").split("?", 1)[0]
             method = req.get("method", "")
             status = entry.get("status", 0)
 
             if method == "POST" and "parse-receipt" in path_only:
-                if status == 200:
-                    row["receipts"] += 1
-                    row["_parseSeconds"] += float(entry.get("duration") or 0)
-                else:
-                    row["failedParses"] += 1
+                ok = status == 200
+                totals["uploads"] += 1
+                totals["receiptsParsed" if ok else "failedParses"] += 1
+                uploads.append(
+                    {
+                        "at": _iso(ts),
+                        "visitor": visitors[key],
+                        "device": device,
+                        "ok": ok,
+                        "outcome": OUTCOMES.get(status, "error %d" % status),
+                        "status": status,
+                        "seconds": round(float(entry.get("duration") or 0), 1),
+                        "photoKB": _upload_kb(entry, req),
+                    }
+                )
             elif method == "GET" and path_only.startswith("/pay/"):
-                # Someone opening the link they were sent. Counted, but it is
-                # not "using the app" in the sense a row means.
+                # Someone opening the link they were sent.
                 totals["payLinkOpens"] += 1
             elif method == "GET" and not path_only.startswith("/api/"):
                 # An extensionless GET is the SPA loading, not an asset.
                 if "." not in path_only.rsplit("/", 1)[-1]:
-                    row["pageViews"] += 1
+                    totals["pageViews"] += 1
 
     totals["visitors"] = len(visitors)
-
-    # Number people in the order they first appeared, so a row keeps its
-    # number between refreshes as the log grows.
-    rows = []
-    for n, row in enumerate(visitors.values(), start=1):
-        attempts = row["receipts"] + row["failedParses"]
-        if not attempts:
-            continue
-        totals["receiptsParsed"] += row["receipts"]
-        rows.append(
-            {
-                "visitor": n,
-                "device": row["device"],
-                "firstSeen": _iso(row["firstSeen"]),
-                "lastSeen": _iso(row["lastSeen"]),
-                "pageViews": row["pageViews"],
-                "receipts": row["receipts"],
-                "failedParses": row["failedParses"],
-                "avgParseSeconds": (
-                    round(row["_parseSeconds"] / row["receipts"], 1)
-                    if row["receipts"]
-                    else None
-                ),
-            }
-        )
-    rows.sort(key=lambda r: r["lastSeen"], reverse=True)
+    uploads.sort(key=lambda u: u["at"], reverse=True)
 
     return {
         "generatedAt": _iso(time.time()),
         "logFiles": len(paths),
         "totals": totals,
-        "people": rows,
+        "uploads": uploads,
     }
 
 
@@ -188,38 +195,65 @@ def access_log_report(pattern: str, max_age_s: int) -> dict:
         return report
 
 
-def render_html(report: dict) -> str:
-    """A phone-readable table. Browsers ask for text/html; everything else
-    gets the JSON, so the same URL serves both."""
-    t = report["totals"]
-    head = (
-        f"{t['visitors']} visitors · {t['receiptsParsed']} receipts parsed · "
-        f"{t['payLinkOpens']} pay links opened · {t['botHits']} bot hits · "
-        f"{t['requests']} requests"
+def _photo(kb) -> str:
+    """Phone photos are a couple of MB; KB past a thousand is hard to read."""
+    if kb is None:
+        return ""
+    return "%d KB" % kb if kb < 1024 else "%.1f MB" % (kb / 1024)
+
+
+def _row(u: dict) -> str:
+    photo = _photo(u["photoKB"])
+    return (
+        '<tr class="%s">' % ("ok" if u["ok"] else "bad")
+        + "<td>%s</td>" % u["at"][:16].replace("T", " ")
+        + "<td>#%d</td>" % u["visitor"]
+        + "<td>%s</td>" % u["device"]
+        + "<td>%s</td>" % u["outcome"]
+        + "<td>%s</td>" % u["seconds"]
+        + "<td>%s</td>" % photo
+        + "</tr>"
     )
-    cells = "".join(
-        "<tr>"
-        f"<td>{r['visitor']}</td><td>{r['device']}</td>"
-        f"<td>{r['firstSeen'][:16].replace('T', ' ')}</td>"
-        f"<td>{r['lastSeen'][:16].replace('T', ' ')}</td>"
-        f"<td>{r['pageViews']}</td><td>{r['receipts']}</td>"
-        f"<td>{r['failedParses']}</td>"
-        f"<td>{'' if r['avgParseSeconds'] is None else r['avgParseSeconds']}</td>"
-        "</tr>"
-        for r in report["people"]
-    ) or '<tr><td colspan="8">Nobody has parsed a receipt yet.</td></tr>'
+
+
+def render_html(report: dict) -> str:
+    """A phone-readable table, newest upload first. Browsers ask for
+    text/html; everything else gets the JSON, so the same URL serves both."""
+    t = report["totals"]
+    head = " &middot; ".join(
+        (
+            "%d receipt%s uploaded" % (t["uploads"], "" if t["uploads"] == 1 else "s"),
+            "%d parsed" % t["receiptsParsed"],
+            "%d failed" % t["failedParses"],
+            "%d visitor%s" % (t["visitors"], "" if t["visitors"] == 1 else "s"),
+            "%d page view%s" % (t["pageViews"], "" if t["pageViews"] == 1 else "s"),
+            "%d pay link%s opened" % (t["payLinkOpens"], "" if t["payLinkOpens"] == 1 else "s"),
+            "%d bot hit%s" % (t["botHits"], "" if t["botHits"] == 1 else "s"),
+            "%d request%s" % (t["requests"], "" if t["requests"] == 1 else "s"),
+        )
+    )
+    rows = "".join(_row(u) for u in report["uploads"]) or (
+        '<tr><td colspan="6">No receipts have been uploaded yet.</td></tr>'
+    )
     return (
         "<!doctype html><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>SplitToWin — who used it</title>"
+        "<title>SplitToWin &mdash; every receipt</title>"
         "<style>body{font:15px system-ui,sans-serif;margin:1rem;color:#222}"
         "table{border-collapse:collapse;width:100%}th,td{padding:.4rem .5rem;"
         "text-align:left;border-bottom:1px solid #ddd;white-space:nowrap}"
-        "th{font-weight:600}div{overflow-x:auto}p{color:#666}</style>"
-        "<h2>Who used SplitToWin</h2>"
-        f"<p>{head}</p><div><table><tr><th>#</th><th>device</th>"
-        "<th>first seen</th><th>last seen</th><th>views</th><th>receipts</th>"
-        f"<th>failed</th><th>avg s</th></tr>{cells}</table></div>"
-        f"<p>Times in SGT. Generated {report['generatedAt'][:19].replace('T', ' ')}"
-        f" from {report['logFiles']} log file(s).</p>"
+        "th{font-weight:600}tr.bad td:nth-child(4){color:#b00020}"
+        "tr.bad td{background:#fff6f6}div{overflow-x:auto}p{color:#666}</style>"
+        "<h2>Every receipt put through SplitToWin</h2>"
+        "<p>" + head + "</p><div><table><tr><th>when</th><th>who</th>"
+        "<th>device</th><th>outcome</th><th>secs</th><th>photo</th></tr>"
+        + rows
+        + "</table></div>"
+        "<p>One row per upload, newest first. &ldquo;Who&rdquo; is a visitor "
+        "number, not a person: the same number means the same device and "
+        "address came back. The receipt itself never reaches the server, so "
+        "what is on it cannot be shown here.</p>"
+        "<p>Times in SGT. Generated "
+        + report["generatedAt"][:19].replace("T", " ")
+        + " from %d log file(s).</p>" % report["logFiles"]
     )
