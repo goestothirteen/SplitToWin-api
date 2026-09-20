@@ -30,6 +30,11 @@ class Config:
     # one did not. Raise it if a receipt ever needs the reasoning.
     GEMINI_THINKING_BUDGET = _int("GEMINI_THINKING_BUDGET", 0)
 
+    # Thinking for the second look at a receipt whose lines don't add up.
+    # -1 lets the model decide how long to think. Only receipts that failed
+    # to reconcile ever pay this, which is a small minority of them.
+    GEMINI_RECHECK_BUDGET = _int("GEMINI_RECHECK_BUDGET", -1)
+
     # Hard ceiling on one call to Gemini. No HTTP request waits on this any
     # more — the parse runs as a background job — so it is set by how long a
     # dense bilingual receipt legitimately takes, not by a worker timeout.

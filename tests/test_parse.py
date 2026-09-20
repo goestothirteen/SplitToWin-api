@@ -38,17 +38,25 @@ def a_photo() -> bytes:
 class FakeProvider:
     """Stands in for a provider module. Same duck type: NAME + parse()."""
 
-    def __init__(self, name, payload=None, error=None, items_seen=0, delay=0.0):
+    def __init__(self, name, payload=None, error=None, items_seen=0, delay=0.0,
+                 payloads=None):
         self.NAME = name
         self.payload = payload
+        # When given, one payload per call: the first read, then the second look.
+        self.payloads = list(payloads or [])
         self.error = error
         self.items_seen = items_seen
         self.delay = delay
         self.calls = 0
 
-    def parse(self, image_bytes, mime_type, timeout_s, report=None):
+    def parse(self, image_bytes, mime_type, timeout_s, report=None,
+              prompt=None, deliberate=False):
         self.calls += 1
         self.seen_timeout = timeout_s
+        self.last_prompt = prompt
+        self.last_deliberate = deliberate
+        if self.payloads:
+            self.payload = self.payloads.pop(0)
         if report and self.items_seen:
             for n in range(1, self.items_seen + 1):
                 report(items=n)
@@ -252,6 +260,69 @@ class FailoverTest(ParseTestBase):
         final = self.settle(self.upload().get_json()["jobId"])
         self.assertEqual(final["status"], "failed")
         self.assertEqual(final["error"], "The reader is busy.")
+
+
+class SecondLookTest(ParseTestBase):
+    """A bill that doesn't add up gets looked at again before it is accepted."""
+
+    # The real case this came from: a receipt printing packaging and add-egg
+    # lines whose prices are already inside the dish above them. Counting
+    # them charges 61.20 for a 54.20 dinner.
+    OVERCOUNTED = dict(
+        GOOD,
+        items=[
+            {"name": "Salted egg chicken rice", "quantity": 4, "line_total": 37.20,
+             "category": "item"},
+            {"name": "Packaging", "quantity": 4, "line_total": 2.00, "category": "item"},
+            {"name": "Add egg", "quantity": 4, "line_total": 4.00, "category": "item"},
+            {"name": "Seafood hor fun", "quantity": 1, "line_total": 9.50,
+             "category": "item"},
+            {"name": "Hokkien mee", "quantity": 1, "line_total": 7.50, "category": "item"},
+        ],
+        total=54.20,
+    )
+    CORRECTED = dict(
+        GOOD,
+        items=[
+            {"name": "Salted egg chicken rice", "quantity": 4, "line_total": 37.20,
+             "category": "item"},
+            {"name": "Seafood hor fun", "quantity": 1, "line_total": 9.50,
+             "category": "item"},
+            {"name": "Hokkien mee", "quantity": 1, "line_total": 7.50, "category": "item"},
+        ],
+        total=54.20,
+    )
+
+    def test_lines_that_do_not_add_up_are_read_again_and_corrected(self):
+        provider = FakeProvider("fake", payloads=[self.OVERCOUNTED, self.CORRECTED])
+        self.chain = [provider]
+        final = self.settle(self.upload().get_json()["jobId"])
+
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(provider.calls, 2)
+        self.assertTrue(provider.last_deliberate, "the second look should think")
+        self.assertIn("54.20", provider.last_prompt or "")
+        receipt = final["receipt"]
+        self.assertEqual(len(receipt["items"]), 3)
+        self.assertIsNone(receipt["discrepancy"])
+        self.assertEqual(receipt["warnings"], [])
+
+    def test_a_second_look_that_is_no_better_leaves_the_first_read_alone(self):
+        provider = FakeProvider("fake", payloads=[self.OVERCOUNTED, self.OVERCOUNTED])
+        self.chain = [provider]
+        final = self.settle(self.upload().get_json()["jobId"])
+
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(provider.calls, 2)
+        # The original stands, discrepancy and all, so the panel still warns.
+        self.assertEqual(len(final["receipt"]["items"]), 5)
+        self.assertAlmostEqual(final["receipt"]["discrepancy"], -6.0, places=2)
+
+    def test_a_receipt_that_adds_up_is_never_read_twice(self):
+        provider = FakeProvider("fake", GOOD)
+        self.chain = [provider]
+        self.settle(self.upload().get_json()["jobId"])
+        self.assertEqual(provider.calls, 1)
 
 
 if __name__ == "__main__":

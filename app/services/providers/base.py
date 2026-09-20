@@ -148,9 +148,24 @@ Rules for a receipt:
   running subtotals are headings even when a price sits on the same row —
   returning one would charge the table twice for everything under it. Return
   only the individual priced lines.
-- Lines priced separately under a dish — packaging, add-ons, extra portions —
-  are their own lines, named in relation to the dish they belong to:
-  "Salted egg chicken rice — packaging", "Salted egg chicken rice — add egg".
+- Indented lines under a dish — packaging, add-ons, extra portions — are
+  often a BREAKDOWN of the price already printed against that dish, not
+  charges on top of it. Decide with arithmetic, not appearance: if the dish
+  lines alone add up to the printed total, the indented lines are already
+  inside them and must not be returned at all. Only return an add-on as its
+  own line when leaving it out makes the receipt fail to add up.
+  Worked example. A receipt prints:
+      4 Salted Egg Chicken Rice        37.20
+          4 Small Packaging             2.00
+          4 Add egg                     4.00
+      1 Seafood Hor Fun Small           9.50
+          1 Small Packaging             0.50
+      1 Hokkien Mee Small               7.50
+          1 Small Packaging             0.50
+      TOTAL                            54.20
+  37.20 + 9.50 + 7.50 = 54.20, which is the total, so the packaging and the
+  eggs are already inside those three prices. Return three lines, not seven.
+  Returning seven would charge the table 61.20 for a 54.20 dinner.
 - Always write `name` in English, whatever language the receipt is in. This is
   read at the table by people splitting a bill, so it has to be scannable.
   - Translate non-English names. Never return the original script, and never
@@ -172,6 +187,41 @@ Rules for a receipt:
   which part, so the person knows whether to reshoot. Say nothing in `warnings` about a receipt you read in
   full — an empty list is the normal case.
 - `subtotal` is the pre-charge total; `total` is the grand total as printed.
+
+Before you answer, add up the `line_total`s you are about to return and
+compare them with the `total` you read. They should match. If they do not,
+you have made a mistake somewhere — most often counting an indented
+breakdown line as a charge, counting a section heading as an item, adding
+tax that was already included, or misreading a digit. Find it and fix it.
+Only if you genuinely cannot make them agree, return your best reading and
+say in `warnings` what the difference is and where you think it comes from.
 """
 
 PROMPT = "Extract every line from this receipt."
+
+
+def reconcile_prompt(items, summed: float, total: float) -> str:
+    """Show the model its own answer and the arithmetic that contradicts it.
+
+    A bill that does not add up is nearly always a reading mistake, not a
+    strange receipt, and the mistake is usually visible the moment the sum is
+    put next to the printed total. Telling the person "these don't add up" is
+    the last resort, not the first answer.
+    """
+    lines = "\n".join(
+        "  %s x%s = %.2f" % (i.get("name"), i.get("quantity"), float(i.get("line_total") or 0))
+        for i in items
+    )
+    return (
+        "You read this receipt and returned these lines:\n\n"
+        + lines
+        + "\n\nThey add up to %.2f, but you read the printed total as %.2f "
+        "\u2014 a difference of %.2f. One of those readings is wrong.\n\n"
+        "Look at the image again and find which. The usual causes, in order "
+        "of likelihood: an indented add-on line counted as a charge when its "
+        "price was already inside the dish above it; a section heading "
+        "counted as an item; tax marked inclusive added on top; a line "
+        "missed; a digit misread; a discount or voucher skipped; or the "
+        "figure you took as the total being a subtotal.\n\n"
+        "Return the corrected receipt." % (summed, total, abs(summed - total))
+    )

@@ -83,7 +83,16 @@ def _lines_so_far(text: str) -> int:
     return text.count('"name"')
 
 
-def parse(image_bytes: bytes, mime_type: str, timeout_s: int, report=noop_report) -> dict:
+def parse(
+    image_bytes: bytes,
+    mime_type: str,
+    timeout_s: int,
+    report=noop_report,
+    prompt: str = None,
+    deliberate: bool = False,
+) -> dict:
+    """`deliberate` buys thinking tokens back for the second look at a receipt
+    that would not add up. The fast path never pays for them."""
     client = _get_client()
     deadline = time.monotonic() + timeout_s
     chunks: list[str] = []
@@ -94,7 +103,7 @@ def parse(image_bytes: bytes, mime_type: str, timeout_s: int, report=noop_report
             model=Config.GEMINI_MODEL,
             contents=[
                 types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                PROMPT,
+                prompt or PROMPT,
             ],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
@@ -102,7 +111,11 @@ def parse(image_bytes: bytes, mime_type: str, timeout_s: int, report=noop_report
                 response_schema=RECEIPT_SCHEMA,
                 temperature=0,
                 thinking_config=types.ThinkingConfig(
-                    thinking_budget=Config.GEMINI_THINKING_BUDGET
+                    thinking_budget=(
+                        Config.GEMINI_RECHECK_BUDGET
+                        if deliberate
+                        else Config.GEMINI_THINKING_BUDGET
+                    )
                 ),
             ),
         )

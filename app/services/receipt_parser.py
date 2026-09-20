@@ -27,7 +27,12 @@ from PIL import Image, ImageOps
 
 from ..config import Config
 from . import providers
-from .providers.base import NotAReceipt, ProviderError, noop_report
+from .providers.base import (
+    NotAReceipt,
+    ProviderError,
+    noop_report,
+    reconcile_prompt,
+)
 
 log = logging.getLogger(__name__)
 
@@ -227,6 +232,62 @@ def _reader_label(index: int) -> str:
     return "the receipt reader" if index == 0 else "the backup reader"
 
 
+def _reconciled(provider, parsed, payload, image_bytes, image_mime, budget, report):
+    """Give a bill that doesn't add up a second look before accepting it.
+
+    A mismatch is nearly always a reading mistake — an add-on counted twice,
+    a heading read as an item — and the mistake is usually obvious once the
+    sum is held against the printed total. Telling the person "these lines
+    don't add up, check them yourself" is the answer of last resort, so this
+    spends one more call, with thinking switched on, trying not to have to.
+
+    Only a read that actually reconciles replaces the first one. If the
+    second look is no better, the original stands with its warning intact.
+    """
+    if parsed.discrepancy is None:
+        return parsed
+
+    remaining = budget - time.monotonic()
+    if remaining <= 5:
+        return parsed
+
+    log.info(
+        "%s: lines off the printed total by %.2f, looking again",
+        provider.NAME,
+        parsed.discrepancy,
+    )
+    report(stage="The lines don't add up — checking the receipt again", items=0)
+    try:
+        second = provider.parse(
+            image_bytes,
+            image_mime,
+            timeout_s=int(remaining),
+            report=report,
+            prompt=reconcile_prompt(payload.get("items") or [], _summed(parsed), parsed.total),
+            deliberate=True,
+        )
+    except NotAReceipt:
+        raise
+    except Exception:
+        log.exception("%s: the second look failed, keeping the first read", provider.NAME)
+        return parsed
+
+    try:
+        _check_is_receipt(second)
+    except NotAReceipt:
+        return parsed
+
+    fixed = _coerce(second, provider.NAME)
+    if fixed.items and fixed.discrepancy is None:
+        log.info("%s: the second look reconciled", provider.NAME)
+        return fixed
+    return parsed
+
+
+def _summed(parsed: ParsedReceipt) -> float:
+    return round(sum(i["lineTotal"] for i in parsed.items), 2)
+
+
 def parse_receipt_image(raw: bytes, mime_type: str, report=noop_report) -> ParsedReceipt:
     """Read the receipt, narrating progress through `report`.
 
@@ -320,6 +381,8 @@ def parse_receipt_image(raw: bytes, mime_type: str, report=noop_report) -> Parse
                     transient=True,
                 )
                 break
+            parsed = _reconciled(provider, parsed, payload, image_bytes,
+                                 image_mime, budget, report)
             if index > 0:
                 log.warning("served by fallback provider %s", provider.NAME)
             return parsed

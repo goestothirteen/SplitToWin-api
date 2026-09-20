@@ -102,8 +102,15 @@ def _extract_json(text: str) -> dict:
 
 
 def parse(
-    image_bytes: bytes, mime_type: str, timeout_s: int, report=noop_report
+    image_bytes: bytes,
+    mime_type: str,
+    timeout_s: int,
+    report=noop_report,
+    prompt: str = None,
+    deliberate: bool = False,
 ) -> dict:
+    """`deliberate` is accepted and ignored: this agent decides for itself how
+    long to think, so there is no budget to hand it."""
     if not _SLOTS.acquire(timeout=_SLOT_WAIT_S):
         log.info("claude_code is busy; deferring to the fallback provider")
         raise ProviderError(
@@ -111,13 +118,17 @@ def parse(
             transient=True,
         )
     try:
-        return _parse(image_bytes, mime_type, timeout_s, report)
+        return _parse(image_bytes, mime_type, timeout_s, report, prompt)
     finally:
         _SLOTS.release()
 
 
 def _parse(
-    image_bytes: bytes, mime_type: str, timeout_s: int, report=noop_report
+    image_bytes: bytes,
+    mime_type: str,
+    timeout_s: int,
+    report=noop_report,
+    prompt_override: str = None,
 ) -> dict:
     suffix = {"image/png": ".png", "image/webp": ".webp"}.get(mime_type, ".jpg")
 
@@ -130,7 +141,8 @@ def _parse(
 
         prompt = (
             f"{SYSTEM_INSTRUCTION}\n\n"
-            f"Read {name} in the current directory. {PROMPT}\n"
+            f"Read {name} in the current directory. "
+            f"{prompt_override or PROMPT}\n"
             "Return ONLY a JSON object with keys: is_receipt (boolean), "
             "reject_reason (string), currency (string), "
             "items (array of {name, quantity, line_total, category}), "
