@@ -42,6 +42,31 @@ _SLOT_WAIT_S = float(os.environ.get("CLAUDE_SLOT_WAIT_S", "3"))
 # else (Bash, Write, Edit, WebFetch, ...) stays unavailable.
 ALLOWED_TOOLS = "Read"
 
+# This machine's ~/.claude is shared with the owner's own agents: MCP servers,
+# skills, plugins, a global CLAUDE.md, and a settings file pinning opus[1m].
+# All of it was being loaded to read a photo of a receipt. Stripping it is
+# both faster and tighter — an untrusted image is no longer handed to an agent
+# holding someone's personal MCP connections.
+#
+# Measured on the same receipt in the container, correct answer every time:
+#   as deployed (opus[1m], everything loaded)  16.4s   $0.21
+#   opus, none of it loaded                    10.5s   $0.11
+#   opus, plus our own system prompt           10.5s   $0.23
+# The last one is no faster and costs more: the standard prompt is cached
+# upstream and a custom one is not. So strip the config, keep the prompt.
+#
+# Haiku was measured twice at 100-150s on this task and is not the shortcut it
+# looks like; the model is the one part worth spending on.
+LEAN_FLAGS = [
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers": {}}',
+    "--disable-slash-commands",
+    "--no-session-persistence",
+    "--setting-sources",
+    "",
+]
+
 _TRANSIENT_MARKERS = (
     "overloaded",
     "rate limit",
@@ -164,10 +189,10 @@ def _parse(
             ALLOWED_TOOLS,
             "--permission-mode",
             "default",
-        ]
-        model = os.environ.get("CLAUDE_MODEL")
-        if model:
-            cmd += ["--model", model]
+        ] + LEAN_FLAGS
+        # Named explicitly because the settings file that used to choose it is
+        # no longer read. Opus measured fastest here; see LEAN_FLAGS.
+        cmd += ["--model", os.environ.get("CLAUDE_MODEL", "opus")]
 
         # Strip inherited API credentials so it uses the machine's subscription
         # login rather than silently billing an unrelated key.
