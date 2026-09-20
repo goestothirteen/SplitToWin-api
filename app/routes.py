@@ -3,21 +3,22 @@
 Every failure leaves here as JSON. The old app let exceptions escape into
 Werkzeug's HTML error page, so the browser's `response.json()` threw while
 parsing the error and the user saw a generic alert with the real cause lost.
+
+Uploading a receipt starts a job and returns at once; the phone then polls
+`GET /parse-receipt/<jobId>` for progress. See `services/jobs.py` for why
+nothing waits on the model with a socket held open any more.
 """
 
 import logging
 import time
+import uuid
 from collections import defaultdict, deque
 
 from flask import Blueprint, current_app, jsonify, request
 
 from .config import Config
-from .services.jobs import cache as job_cache
-from .services.receipt_parser import (
-    ReceiptParseError,
-    active_providers,
-    parse_receipt_image,
-)
+from .services.jobs import store as jobs
+from .services.receipt_parser import active_providers, parse_receipt_image
 from .services.stats import access_log_report, render_html
 
 log = logging.getLogger(__name__)
@@ -87,6 +88,10 @@ def stats():
 
 @api.post("/parse-receipt")
 def parse_receipt():
+    """Take the photo, start reading it, and answer immediately with a job id.
+
+    The response is 202, never the receipt: the caller polls for the result.
+    """
     if _rate_limited(_client_ip()):
         return (
             jsonify(
@@ -125,65 +130,50 @@ def parse_receipt():
     if not raw:
         return jsonify({"error": "That file was empty.", "code": "empty"}), 400
 
-    started = time.monotonic()
+    # Phones drop the connection when backgrounded, so the client reuses its
+    # job id. The same id arriving twice attaches to the parse already
+    # running instead of reading the same receipt a second time.
+    job_id = (request.form.get("jobId") or "").strip()[:64] or uuid.uuid4().hex
+    mime = upload.mimetype or "image/jpeg"
 
-    # Phones drop the connection when backgrounded, so the client retries with
-    # the same job id. Reusing the result means a retry costs nothing and
-    # returns instantly, instead of parsing the same receipt twice.
-    job_id = (request.form.get("jobId") or "").strip()[:64]
-
-    if job_id:
-        is_owner, entry = job_cache.claim(job_id)
-        if not is_owner:
-            if entry.result is not None:
-                log.info("job %s already parsed, serving cached result", job_id)
-                return jsonify(entry.result)
-            # Someone else is mid-parse: wait for them rather than starting a
-            # second one. The wait is bounded well under the worker timeout.
-            log.info("job %s already in flight, waiting", job_id)
-            result, error, timed_out = job_cache.wait(entry, Config.PARSE_DEADLINE_S)
-            if timed_out:
-                return (
-                    jsonify(
-                        {
-                            "error": "Still reading that receipt. Try again in a moment.",
-                            "code": "in_progress",
-                        }
-                    ),
-                    503,
-                )
-            if error is not None:
-                return (
-                    jsonify({"error": str(error), "code": "parse_failed"}),
-                    getattr(error, "status", 502),
-                )
-            return jsonify(result)
-
-    try:
-        parsed = parse_receipt_image(raw, upload.mimetype or "image/jpeg")
-    except ReceiptParseError as exc:
-        log.warning(
-            "parse failed status=%s reason=%s bytes=%d",
-            exc.status,
-            exc.message,
+    def work(report):
+        started = time.monotonic()
+        parsed = parse_receipt_image(raw, mime, report)
+        log.info(
+            "parsed receipt items=%d bytes=%d ms=%d job=%s",
+            len(parsed.items),
             len(raw),
+            int((time.monotonic() - started) * 1000),
+            job_id,
         )
-        if job_id:
-            job_cache.finish(job_id, None, exc)
-        return jsonify({"error": exc.message, "code": "parse_failed"}), exc.status
+        return parsed.to_dict()
 
-    payload = parsed.to_dict()
-    if job_id:
-        job_cache.finish(job_id, payload, None)
+    job, is_new = jobs.start(job_id, work)
+    if not is_new:
+        log.info("job %s already under way, attaching", job_id)
+    return jsonify(job.snapshot()), 202
 
-    log.info(
-        "parsed receipt items=%d bytes=%d ms=%d job=%s",
-        len(parsed.items),
-        len(raw),
-        int((time.monotonic() - started) * 1000),
-        job_id or "-",
-    )
-    return jsonify(payload)
+
+@api.get("/parse-receipt/<job_id>")
+def parse_progress(job_id: str):
+    """How that parse is going. Polled about once a second while it runs.
+
+    A finished-but-failed job is still a successful poll, so the failure
+    travels in the body rather than as an HTTP error the client has to
+    unpick. Only "I have never heard of this job" is a 404.
+    """
+    job = jobs.get((job_id or "").strip()[:64])
+    if job is None:
+        return (
+            jsonify(
+                {
+                    "error": "That upload has expired. Send the photo again.",
+                    "code": "job_unknown",
+                }
+            ),
+            404,
+        )
+    return jsonify(job.snapshot())
 
 
 @api.app_errorhandler(413)

@@ -9,6 +9,13 @@ Which model is a deployment choice, not a code change — see `providers/`.
 This module owns everything provider-independent: image preparation, the
 failover and retry policy, and coercing the reply into something the frontend
 can trust.
+
+Each provider gets its *own* time budget rather than sharing one deadline.
+Under the old shared deadline a slow primary spent almost all of it before
+failing, so the fallback was handed a second or two and failed immediately —
+the failover existed on paper and never once rescued a receipt. Nothing holds
+an HTTP connection open while this runs any more (see `jobs.py`), so the
+budgets can be generous enough for a long bilingual receipt.
 """
 
 import io
@@ -20,7 +27,7 @@ from PIL import Image, ImageOps
 
 from ..config import Config
 from . import providers
-from .providers.base import ProviderError
+from .providers.base import NotAReceipt, ProviderError, noop_report
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +37,11 @@ SUPPORTED_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/
 class ReceiptParseError(Exception):
     """Raised when we cannot turn the image into usable items."""
 
-    def __init__(self, message: str, *, status: int = 502):
+    def __init__(self, message: str, *, status: int = 502, code: str = "parse_failed"):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,10 @@ class ParsedReceipt:
     # instead of silently splitting a bill that's already wrong.
     discrepancy: float | None
     provider: str
+    # The model's own account of what it could not read. Shown next to the
+    # items, because a bill that is 90% right is worth more than an error —
+    # but only if the missing 10% is named.
+    warnings: list[str]
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +67,7 @@ class ParsedReceipt:
             "total": self.total,
             "discrepancy": self.discrepancy,
             "provider": self.provider,
+            "warnings": self.warnings,
         }
 
 
@@ -82,7 +95,9 @@ def normalise_image(raw: bytes) -> tuple[bytes, str]:
             encoded = out.getvalue()
     except Exception as exc:
         raise ReceiptParseError(
-            "That file doesn't look like an image we can read.", status=400
+            "That file doesn't look like an image we can read.",
+            status=400,
+            code="bad_image",
         ) from exc
 
     # Re-encoding an already-small JPEG can come out larger than the original.
@@ -97,6 +112,39 @@ def normalise_image(raw: bytes) -> tuple[bytes, str]:
     return encoded, "image/jpeg"
 
 
+def _one_line(value) -> str:
+    """Model prose arrives wrapped at the width of the prompt it copied from.
+    A newline mid-sentence breaks every alert it lands in."""
+    return " ".join(str(value or "").split())
+
+
+def _warnings(payload: dict) -> list[str]:
+    out = []
+    for raw in payload.get("warnings") or []:
+        text = _one_line(raw)
+        if text:
+            out.append(text[:200])
+    return out[:8]
+
+
+def _rejected(exc: NotAReceipt) -> "ReceiptParseError":
+    return ReceiptParseError(exc.message, status=422, code="not_a_receipt")
+
+
+def _check_is_receipt(payload: dict) -> None:
+    """Honour the model's own refusal.
+
+    Only an explicit `false` counts. A provider that omits the key — an older
+    Claude Code reply, say — must not have silence read as a rejection.
+    """
+    if payload.get("is_receipt") is not False:
+        return
+    reason = _one_line(payload.get("reject_reason"))
+    raise NotAReceipt(
+        reason or "That photo doesn't look like a receipt. Try the printed bill."
+    )
+
+
 def _coerce(payload: dict, provider_name: str) -> ParsedReceipt:
     """Normalise the model's output into something the UI can trust.
 
@@ -107,7 +155,10 @@ def _coerce(payload: dict, provider_name: str) -> ParsedReceipt:
     """
     items = []
     for idx, raw in enumerate(payload.get("items") or []):
-        name = str(raw.get("name") or "").strip() or "Unnamed item"
+        # Models sometimes wrap a long name onto two lines. A newline inside
+        # a name breaks every row it is rendered in, so names are always
+        # collapsed to one line here rather than trusted.
+        name = _one_line(raw.get("name")) or "Unnamed item"
         try:
             line_total = round(float(raw.get("line_total") or 0), 2)
         except (TypeError, ValueError):
@@ -142,6 +193,16 @@ def _coerce(payload: dict, provider_name: str) -> ParsedReceipt:
     if discrepancy is not None and abs(discrepancy) < 0.01:
         discrepancy = None
 
+    warnings = _warnings(payload)
+    # A price the model gave up on is the most common reason a bill won't
+    # reconcile, and the item list alone doesn't say which line it was.
+    unpriced = [i["name"] for i in items if i["lineTotal"] == 0]
+    if unpriced and not warnings:
+        warnings.append(
+            "No price was readable for: " + ", ".join(unpriced[:5]) + "."
+        )
+
+
     return ParsedReceipt(
         currency=str(payload.get("currency") or "").strip(),
         items=items,
@@ -149,6 +210,7 @@ def _coerce(payload: dict, provider_name: str) -> ParsedReceipt:
         total=total,
         discrepancy=discrepancy,
         provider=provider_name,
+        warnings=warnings,
     )
 
 
@@ -159,36 +221,71 @@ def active_providers() -> list[str]:
     return [p.NAME for p in chain]
 
 
-def parse_receipt_image(raw: bytes, mime_type: str) -> ParsedReceipt:
+# What the person waiting should be told each reader is doing. The provider
+# name is an implementation detail; "the backup reader" is not.
+def _reader_label(index: int) -> str:
+    return "the receipt reader" if index == 0 else "the backup reader"
+
+
+def parse_receipt_image(raw: bytes, mime_type: str, report=noop_report) -> ParsedReceipt:
+    """Read the receipt, narrating progress through `report`.
+
+    `report` is called with keyword arguments the job layer understands:
+    `stage` (a sentence for the person waiting), `detail`, and `items` (how
+    many lines have been read so far). It must never raise.
+    """
     if mime_type not in SUPPORTED_MIME:
-        raise ReceiptParseError(f"Unsupported image type: {mime_type}", status=415)
+        raise ReceiptParseError(
+            f"Unsupported image type: {mime_type}", status=415, code="unsupported_type"
+        )
 
     chain = providers.resolve_chain(
         Config.RECEIPT_PROVIDER, Config.RECEIPT_FALLBACK_PROVIDER
     )
     if not chain:
         raise ReceiptParseError(
-            "Receipt parsing is not configured on this server.", status=503
+            "Receipt parsing is not configured on this server.",
+            status=503,
+            code="not_configured",
         )
 
+    report(stage="Getting the photo ready")
     image_bytes, image_mime = normalise_image(raw)
 
-    # Every attempt across every provider shares one wall-clock deadline, so a
-    # retry storm can never outlive the gunicorn worker timeout and turn a slow
-    # parse into a SIGKILLed worker and a 502.
-    deadline = time.monotonic() + Config.PARSE_DEADLINE_S
     last: ProviderError | None = None
 
-    for provider in chain:
+    for index, provider in enumerate(chain):
+        label = _reader_label(index)
+        if index > 0:
+            log.warning("failing over to %s", provider.NAME)
+            report(stage="First reader gave up — trying the backup", items=0)
+
+        # Each provider gets a fresh budget. Attempts within one provider
+        # share it, so a retry loop still cannot run forever.
+        budget = time.monotonic() + Config.PROVIDER_BUDGET_S
         backoff = 1.0
+
         for attempt in range(1, Config.PROVIDER_MAX_ATTEMPTS + 1):
-            remaining = deadline - time.monotonic()
+            remaining = budget - time.monotonic()
             if remaining <= 1:
                 break
+            report(
+                stage=(
+                    f"Reading the receipt with {label}"
+                    if attempt == 1
+                    else f"Trying {label} again"
+                ),
+                items=0,
+            )
             try:
                 payload = provider.parse(
-                    image_bytes, image_mime, timeout_s=int(remaining)
+                    image_bytes, image_mime, timeout_s=int(remaining), report=report
                 )
+            except NotAReceipt as exc:
+                # The model looked and said this is not a bill. Asking a second
+                # reader the same question wastes half a minute to be told the
+                # same thing, so this ends the whole attempt.
+                raise _rejected(exc) from exc
             except ProviderError as exc:
                 last = exc
                 if not exc.transient:
@@ -201,25 +298,36 @@ def parse_receipt_image(raw: bytes, mime_type: str) -> ParsedReceipt:
                     backoff *= 2
                     continue
                 break
-            except Exception as exc:  # a provider bug must not become a 500
+            except Exception:  # a provider bug must not become a 500
                 log.exception("provider %s raised unexpectedly", provider.NAME)
                 last = ProviderError("Couldn't read that receipt.", transient=True)
                 break
 
+            report(stage="Checking the lines add up")
+            try:
+                _check_is_receipt(payload)
+            except NotAReceipt as exc:
+                raise _rejected(exc) from exc
             parsed = _coerce(payload, provider.NAME)
             if not parsed.items:
+                # It said it was a receipt and then listed nothing. That is a
+                # bad read of a real bill, not a rejection, so it is worth
+                # letting the other reader try.
                 last = ProviderError(
-                    "No items found on that receipt. Try a clearer, straighter photo.",
+                    "No line items could be read off that receipt. "
+                    "Try a straighter photo with the whole bill in frame.",
                     status=422,
+                    transient=True,
                 )
                 break
-            if provider is not chain[0]:
+            if index > 0:
                 log.warning("served by fallback provider %s", provider.NAME)
             return parsed
 
-        if len(chain) > 1 and provider is not chain[-1]:
-            log.warning("provider %s exhausted, failing over", provider.NAME)
-
-    if last is not None:
-        raise ReceiptParseError(last.message, status=last.status)
+    if isinstance(last, ProviderError):
+        raise ReceiptParseError(
+            last.message,
+            status=last.status,
+            code="no_items" if last.status == 422 else "parse_failed",
+        )
     raise ReceiptParseError("Couldn't read that receipt. Try again.")

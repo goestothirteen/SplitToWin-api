@@ -19,6 +19,22 @@ class ProviderError(Exception):
         self.status = status
 
 
+class NotAReceipt(ProviderError):
+    """The model looked and says this photo is not a bill.
+
+    Its own explanation is the message. Never transient and never worth
+    failing over: a second reader will look at the same menu photo and say
+    the same thing, slower.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, transient=False, status=422)
+
+
+def noop_report(**_kwargs) -> None:
+    """Progress sink for callers that aren't watching (tests, the CLI)."""
+
+
 # Categories matter to the split, not just the display. Service charge and tax
 # have to be re-apportioned across people in proportion to what each person
 # actually ate — splitting them evenly is what made the old bills unfair — so
@@ -26,6 +42,21 @@ class ProviderError(Exception):
 RECEIPT_SCHEMA = {
     "type": "object",
     "properties": {
+        "is_receipt": {
+            "type": "boolean",
+            "description": (
+                "True only if this image is a bill, receipt or itemised order "
+                "with charged lines on it."
+            ),
+        },
+        "reject_reason": {
+            "type": "string",
+            "description": (
+                "When is_receipt is false: one plain sentence saying what the "
+                "photo appears to be instead, and what to photograph. Empty "
+                "string when is_receipt is true."
+            ),
+        },
         "currency": {
             "type": "string",
             "description": "ISO 4217 code if determinable, else empty string.",
@@ -63,12 +94,39 @@ RECEIPT_SCHEMA = {
             "type": "number",
             "description": "Grand total as printed. 0 if not shown.",
         },
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "One plain sentence per thing you could not read with "
+                "confidence, naming the line it was on. Empty when the whole "
+                "receipt was legible."
+            ),
+        },
     },
-    "required": ["currency", "items", "subtotal", "total"],
+    "required": [
+        "is_receipt",
+        "reject_reason",
+        "currency",
+        "items",
+        "subtotal",
+        "total",
+        "warnings",
+    ],
 }
 
 SYSTEM_INSTRUCTION = """\
-You read restaurant receipts and return structured data. Rules:
+You read restaurant receipts and return structured data.
+
+First decide whether the image is a bill at all. Set `is_receipt` false for
+anything without charged lines on it — a menu, a photo of food, a screenshot,
+a person, a blank or unreadable frame — and put one plain sentence in
+`reject_reason` saying what it looks like instead and what to photograph, for
+example "That's the menu, not the bill — photograph the printed receipt." Do
+not invent items for an image that is not a receipt. When it is a receipt,
+set `is_receipt` true and leave `reject_reason` empty.
+
+Rules for a receipt:
 
 - Return every charged line, in the order printed.
 - `line_total` is the amount printed for that line — the total for all units on
@@ -77,9 +135,22 @@ You read restaurant receipts and return structured data. Rules:
 - Classify each line: food and drink are "item"; service charge is
   "service_charge"; GST/VAT/sales tax is "tax"; discounts and vouchers are
   "discount" (negative line_total); rounding adjustments are "rounding".
+- Tax already inside the prices is not a line. When the receipt marks it
+  inclusive — "GST 9% (inc)", "inclusive of GST", "prices include tax" —
+  leave it out entirely: it is inside every item total already, and adding it
+  charges the table for it twice. Return a tax line only when the receipt
+  adds it on top of the items.
 - Sub-items printed under a set or combo with no price of their own are not
   separate lines. Fold their names into the parent, e.g.
   "Cocktail Party for 2 (Pineapple Rum, Ume Dream)".
+- A heading that prints the total for the lines beneath it is not an item.
+  Section names ("Chargeable Items", "Rice Plate (Chicken)", "Drinks") and
+  running subtotals are headings even when a price sits on the same row —
+  returning one would charge the table twice for everything under it. Return
+  only the individual priced lines.
+- Lines priced separately under a dish — packaging, add-ons, extra portions —
+  are their own lines, named in relation to the dish they belong to:
+  "Salted egg chicken rice — packaging", "Salted egg chicken rice — add egg".
 - Always write `name` in English, whatever language the receipt is in. This is
   read at the table by people splitting a bill, so it has to be scannable.
   - Translate non-English names. Never return the original script, and never
@@ -94,7 +165,12 @@ You read restaurant receipts and return structured data. Rules:
     still write it in Latin script.
   - Modifiers priced on their own line stay their own line, named in relation
     to what they modify: "Extra rice", "Less ice".
-- If a price is smudged or unreadable, use 0 rather than guessing.
+- If a price is smudged or unreadable, use 0 rather than guessing, and say so
+  in `warnings` naming the line: "The price on the second noodle line is
+  cut off." Also warn when part of the receipt is out of frame, folded,
+  covered by a finger or hand, lost to glare, or too blurred to read — say
+  which part, so the person knows whether to reshoot. Say nothing in `warnings` about a receipt you read in
+  full — an empty list is the normal case.
 - `subtotal` is the pre-charge total; `total` is the grand total as printed.
 """
 

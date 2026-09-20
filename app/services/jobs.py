@@ -1,20 +1,21 @@
-"""Short-lived results, keyed by a client-supplied job id.
+"""Receipt parses that outlive the request that started them.
 
-Phones background aggressively. iOS Safari suspends a tab when you switch
-apps, and under memory pressure discards it outright — so a parse that takes
-12-30s routinely loses its connection halfway through even though the server
-finished the work.
+Reading a busy receipt takes 30-60s. Holding an HTTP connection open for that
+was the single biggest source of failure in this app: iOS Safari suspends a
+backgrounded tab and drops the socket, so a parse the server had *finished*
+came back to the person as an error, and a genuinely slow receipt hit a
+deadline that existed only to stay under the gunicorn worker timeout.
 
-The client retries with the same job id when it comes back. Without this, that
-retry would run the model a second time: slower for the user, and a second
-charge against the quota for a receipt already parsed. So:
+So the upload starts a job and returns immediately, and the phone asks how it
+is going every second or so. Nothing is holding a socket, which is what lets
+the time budget be generous, the waiting screen show real progress instead of
+a spinner, and a phone that went to sleep for two minutes pick the answer up
+intact when it wakes.
 
-  * a completed result is served straight from here, no model call
-  * a retry that arrives while the first is *still running* waits for it,
-    rather than starting a competing parse
-
-The cache is per-process and deliberately small. Losing it costs one re-parse,
-which is the same as not having it, so there is no need for anything durable.
+Jobs live in memory, in one process (see `gunicorn.conf.py` — a second worker
+would answer half the polls with "never heard of it"). Losing them on restart
+costs one re-upload, which is why nothing here is written to disk: the receipt
+and its contents stay in RAM for fifteen minutes and are never persisted.
 """
 
 import logging
@@ -26,71 +27,154 @@ log = logging.getLogger(__name__)
 
 TTL_S = 900  # 15 minutes: long enough to answer a phone call mid-dinner
 MAX_ENTRIES = 64
+# The box has 1 vCPU and shares it with two other apps. The Claude Code
+# provider already caps itself at one Node process; this stops a queue of
+# uploads from stacking image work on top of that.
+MAX_ACTIVE = 3
+
+QUEUED = "queued"
+RUNNING = "running"
+DONE = "done"
+FAILED = "failed"
 
 
 @dataclass
-class _Entry:
-    created: float
-    done: threading.Event = field(default_factory=threading.Event)
+class Job:
+    id: str
+    created: float = field(default_factory=time.monotonic)
+    status: str = QUEUED
+    stage: str = "Waiting for a free reader"
+    detail: str = ""
+    items: int = 0
     result: dict | None = None
     error: Exception | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def report(self, stage: str = None, detail: str = None, items: int = None) -> None:
+        """Called from the worker thread as the parse moves along.
+
+        Must never raise: a progress update failing would otherwise take down
+        a parse that was going perfectly well.
+        """
+        try:
+            with self._lock:
+                if stage is not None:
+                    self.stage = stage
+                    # A new stage invalidates the old detail; leaving it would
+                    # caption the new step with the last one's text.
+                    if detail is None:
+                        self.detail = ""
+                if detail is not None:
+                    self.detail = detail
+                if items is not None:
+                    self.items = items
+        except Exception:  # pragma: no cover - defensive
+            log.exception("progress update failed")
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            out = {
+                "jobId": self.id,
+                "status": self.status,
+                "stage": self.stage,
+                "detail": self.detail,
+                "itemsFound": self.items,
+                "elapsedSeconds": round(time.monotonic() - self.created, 1),
+            }
+        if self.status == DONE:
+            out["receipt"] = self.result
+        elif self.status == FAILED:
+            out["error"] = getattr(self.error, "message", None) or "Couldn't read that receipt."
+            out["code"] = getattr(self.error, "code", "parse_failed")
+        return out
 
 
-class JobCache:
-    def __init__(self, ttl_s: int = TTL_S, max_entries: int = MAX_ENTRIES):
+class JobStore:
+    def __init__(self, ttl_s: int = TTL_S, max_entries: int = MAX_ENTRIES,
+                 max_active: int = MAX_ACTIVE):
         self._ttl = ttl_s
         self._max = max_entries
+        self._slots = threading.BoundedSemaphore(max_active)
         self._lock = threading.Lock()
-        self._entries: dict[str, _Entry] = {}
+        self._jobs: dict[str, Job] = {}
 
     def _evict(self) -> None:
-        """Called with the lock held."""
+        """Called with the lock held. Never evicts a job still running."""
         now = time.monotonic()
-        stale = [k for k, e in self._entries.items() if now - e.created > self._ttl]
-        for key in stale:
-            self._entries.pop(key, None)
-        while len(self._entries) > self._max:
-            oldest = min(self._entries, key=lambda k: self._entries[k].created)
-            self._entries.pop(oldest, None)
+        for key in [
+            k
+            for k, j in self._jobs.items()
+            if now - j.created > self._ttl and j.status in (DONE, FAILED)
+        ]:
+            self._jobs.pop(key, None)
+        while len(self._jobs) > self._max:
+            finished = [k for k, j in self._jobs.items() if j.status in (DONE, FAILED)]
+            if not finished:
+                break
+            self._jobs.pop(min(finished, key=lambda k: self._jobs[k].created), None)
 
-    def claim(self, job_id: str):
-        """Take ownership of a job, or get the entry someone else owns.
+    def get(self, job_id: str) -> Job | None:
+        with self._lock:
+            return self._jobs.get(job_id)
 
-        @returns (is_owner, entry). The owner runs the parse and calls
-        finish(); everyone else waits on the entry.
+    def start(self, job_id: str, work) -> tuple[Job, bool]:
+        """Begin `work(job)` in the background, unless this id is already going.
+
+        @returns (job, is_new). A repeat upload of the same id — the phone
+        retrying after a dropped connection — attaches to the job already
+        running rather than reading the same receipt twice.
         """
         with self._lock:
             self._evict()
-            existing = self._entries.get(job_id)
+            existing = self._jobs.get(job_id)
             if existing is not None:
-                return False, existing
-            entry = _Entry(created=time.monotonic())
-            self._entries[job_id] = entry
-            return True, entry
+                return existing, False
+            job = Job(id=job_id)
+            self._jobs[job_id] = job
 
-    def finish(self, job_id: str, result: dict | None, error: Exception | None) -> None:
-        with self._lock:
-            entry = self._entries.get(job_id)
-        if entry is None:
+        thread = threading.Thread(
+            target=self._run, args=(job, work), name=f"parse-{job_id[:8]}", daemon=True
+        )
+        thread.start()
+        return job, True
+
+    def _run(self, job: Job, work) -> None:
+        acquired = self._slots.acquire(timeout=120)
+        if not acquired:
+            # Every reader has been busy for two minutes. Saying so is more
+            # use than letting the job sit in "queued" forever.
+            self._fail(job, RuntimeError("busy"), "The readers are all busy. Try again in a moment.", "busy")
             return
-        entry.result = result
-        entry.error = error
-        # A failure is not worth caching: the client should be free to retry
-        # and actually get another attempt.
-        if error is not None:
-            with self._lock:
-                self._entries.pop(job_id, None)
-        entry.done.set()
+        try:
+            job.status = RUNNING
+            job.report(stage="Getting the photo ready")
+            result = work(job.report)
+        except Exception as exc:
+            self._fail(job, exc)
+        else:
+            job.result = result
+            job.status = DONE
+            job.report(stage="Done", detail="")
+            job.done.set()
+        finally:
+            self._slots.release()
 
-    def wait(self, entry: _Entry, timeout_s: float):
-        """Wait for whoever owns this job. Returns (result, error, timed_out)."""
-        if entry.done.wait(timeout=timeout_s):
-            return entry.result, entry.error, False
-        return None, None, True
+    def _fail(self, job: Job, exc: Exception, message: str = None, code: str = None) -> None:
+        if message is not None and not hasattr(exc, "message"):
+            exc.message = message
+        if code is not None and not hasattr(exc, "code"):
+            exc.code = code
+        if not hasattr(exc, "message"):
+            log.exception("parse job %s failed unexpectedly", job.id)
+        job.error = exc
+        job.status = FAILED
+        job.report(stage="Stopped", detail="")
+        job.done.set()
 
     def drop(self, job_id: str) -> None:
         with self._lock:
-            self._entries.pop(job_id, None)
+            self._jobs.pop(job_id, None)
 
 
-cache = JobCache()
+store = JobStore()

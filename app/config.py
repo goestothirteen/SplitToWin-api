@@ -22,10 +22,18 @@ class Config:
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
     GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-    # Hard ceiling on how long we'll wait for the model. Must stay comfortably
-    # under the gunicorn worker timeout or the worker gets SIGKILLed mid-request
-    # and the client sees a 502 instead of a useful error.
-    GEMINI_TIMEOUT_S = _int("GEMINI_TIMEOUT_S", 45)
+    # Thinking tokens before it answers. Flash thinks by default, and on a
+    # dense bilingual receipt it spent 50 SECONDS thinking before emitting a
+    # character — the whole of the timeout problem, in one setting. Measured
+    # on that receipt: 80.5s thinking on vs 5.1s off, same nine lines, and
+    # the no-thinking read reconciled to the printed total while the thinking
+    # one did not. Raise it if a receipt ever needs the reasoning.
+    GEMINI_THINKING_BUDGET = _int("GEMINI_THINKING_BUDGET", 0)
+
+    # Hard ceiling on one call to Gemini. No HTTP request waits on this any
+    # more — the parse runs as a background job — so it is set by how long a
+    # dense bilingual receipt legitimately takes, not by a worker timeout.
+    GEMINI_TIMEOUT_S = _int("GEMINI_TIMEOUT_S", 120)
 
     # Which backend reads the receipt. "claude_code" runs headless Claude
     # Code on this machine against the local subscription login; "gemini"
@@ -37,11 +45,14 @@ class Config:
         os.environ.get("RECEIPT_FALLBACK_PROVIDER", "").strip().lower()
     )
 
-    # Retries against transient upstream errors. The deadline bounds every
-    # attempt across every provider together, so a retry storm can never
-    # outlive the gunicorn worker timeout and turn a slow parse into a 502.
+    # Retries against transient upstream errors.
     PROVIDER_MAX_ATTEMPTS = _int("PROVIDER_MAX_ATTEMPTS", 2)
-    PARSE_DEADLINE_S = _int("PARSE_DEADLINE_S", 55)
+
+    # How long EACH provider gets, attempts included. Previously one deadline
+    # was shared across the whole chain, so a slow primary spent all of it and
+    # the fallback was handed a second or two — every failover failed
+    # instantly. A budget per provider is what makes the backup reader real.
+    PROVIDER_BUDGET_S = _int("PROVIDER_BUDGET_S", 120)
 
     # Receipt photos from phones are 3-12 MB. Anything past this is not a
     # receipt, and refusing it early keeps someone from burning the quota.
