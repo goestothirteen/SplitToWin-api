@@ -128,8 +128,17 @@ def _warnings(payload: dict) -> list[str]:
     for raw in payload.get("warnings") or []:
         text = _one_line(raw)
         if text:
-            out.append(text[:200])
+            out.append(_clipped(text))
     return out[:8]
+
+
+def _clipped(text: str, limit: int = 240) -> str:
+    """Long enough for a real explanation, cut at a word so it reads as a
+    sentence that trails off rather than a string that broke."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return head + "…"
 
 
 def _rejected(exc: NotAReceipt) -> "ReceiptParseError":
