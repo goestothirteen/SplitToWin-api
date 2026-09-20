@@ -44,6 +44,9 @@ BOT_MARKERS = (
 # What the status code meant to the person holding the phone. Anything not
 # listed is shown as the bare code rather than guessed at.
 OUTCOMES = {
+    # Caddy writes status 0 when nothing was ever sent back — the phone went
+    # to sleep or the person gave up while the model was still reading.
+    0: "connection dropped",
     200: "parsed",
     400: "bad upload",
     413: "photo too large",

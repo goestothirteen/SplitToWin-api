@@ -114,6 +114,17 @@ class SummariseTest(unittest.TestCase):
         self.assertEqual(newest["visitor"], second["visitor"])  # both 1.1.1.1
         self.assertNotEqual(newest["visitor"], oldest["visitor"])  # 6.6.6.6
 
+    def test_a_phone_that_slept_mid_parse_is_named_not_shown_as_error_0(self):
+        with open(os.path.join(self.tmp.name, "split2win.log"), "a") as f:
+            f.write(
+                line(T0 + 550, "8.8.8.8", IPHONE, "POST", "/api/parse-receipt", 0, 41.2)
+                + "\n"
+            )
+        report = stats.access_log_report(self.pattern, max_age_s=0)
+        row = report["uploads"][0]
+        self.assertEqual(row["outcome"], "connection dropped")
+        self.assertFalse(row["ok"])
+
     def test_an_unmapped_status_shows_the_code_rather_than_guessing(self):
         with open(os.path.join(self.tmp.name, "split2win.log"), "a") as f:
             f.write(line(T0 + 600, "7.7.7.7", ANDROID, "POST", "/api/parse-receipt", 418) + "\n")
