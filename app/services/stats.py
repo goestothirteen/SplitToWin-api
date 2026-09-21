@@ -5,13 +5,20 @@ edge proxy writes, which compose mounts read-only into this container. A row
 here is one submitted receipt photo, successful or not; loading the page and
 leaving is not using the app, so that is a headline count instead.
 
-What a row can say is bounded by what the log knows. The receipt itself —
-merchant, items, totals, who owes what — never reaches the server, and pay
-link payloads are blanked by the log filter before they are written, so the
-detail per upload is when, from what kind of device, how it ended, how long
-it took and how big the photo was. Addresses are read only to tell visitors
-apart and are never returned, which is what lets /stats be an open URL:
-there is nothing on it worth guarding with a login.
+Reading a receipt happens on a background job now, which the log cannot see
+into: the upload itself only ever answers 202 "accepted". So a row is built
+from two things — the POST that handed the photo over, and the progress
+checks that followed it, which carry the job id in their path. A check that
+came back an error is how the parse failed; the last check tells us how long
+the person actually waited. A job nobody ever checked on is a phone that
+walked away.
+
+What a row can say is still bounded by what the log knows. The receipt itself
+— merchant, items, totals, who owes what — never reaches the server, and pay
+link payloads are blanked by the log filter before they are written.
+Addresses are read only to tell visitors apart and are never returned, which
+is what lets /stats be an open URL: there is nothing on it worth guarding
+with a login.
 """
 
 import glob
@@ -41,19 +48,29 @@ BOT_MARKERS = (
     "nmap",
 )
 
-# What the status code meant to the person holding the phone. Anything not
-# listed is shown as the bare code rather than guessed at.
-OUTCOMES = {
-    # Caddy writes status 0 when nothing was ever sent back — the phone went
-    # to sleep or the person gave up while the model was still reading.
-    0: "connection dropped",
+# What the upload itself came back with. 202 means the photo was taken and a
+# job started — how that job went is decided by the progress checks below.
+# 200 only appears on lines from before parsing moved off the request.
+UPLOAD_OUTCOMES = {
     200: "parsed",
+    202: None,  # decided by the progress checks
     400: "bad upload",
     413: "photo too large",
     429: "rate limited",
-    502: "parse failed",
-    503: "still parsing",
 }
+
+# What a failed progress check means. Both 422s say the photo was no use;
+# the log cannot tell "that's a menu" from "no lines could be read", and the
+# difference does not change what the person has to do about it.
+CHECK_OUTCOMES = {
+    404: "expired before it was collected",
+    422: "not a usable receipt",
+    500: "server error",
+    502: "parse failed",
+    503: "readers busy",
+}
+
+PARSE_PATH = "/parse-receipt"
 
 
 def device_label(user_agent: str) -> str:
@@ -81,6 +98,14 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, SGT).isoformat(timespec="seconds")
 
 
+def _job_id(path_only: str) -> str:
+    """The job id a /parse-receipt/<id> path carries, or "" for the bare path."""
+    marker = PARSE_PATH + "/"
+    if marker not in path_only:
+        return ""
+    return path_only.split(marker, 1)[1].split("/", 1)[0][:64]
+
+
 def _upload_kb(entry: dict, req: dict):
     """How big the photo was. Caddy records the request body it read; a line
     without that field may still carry the length the phone declared."""
@@ -102,12 +127,15 @@ def summarise(paths) -> dict:
     # order, which keeps a number attached to the same person as the log grows.
     visitors: "OrderedDict[tuple, int]" = OrderedDict()
     uploads = []
+    # job id -> what its progress checks said
+    checks: dict[str, dict] = {}
     totals = {
         "requests": 0,
         "visitors": 0,
         "uploads": 0,
         "receiptsParsed": 0,
         "failedParses": 0,
+        "progressChecks": 0,
         "pageViews": 0,
         "payLinkOpens": 0,
         "botHits": 0,
@@ -140,22 +168,30 @@ def summarise(paths) -> dict:
             method = req.get("method", "")
             status = entry.get("status", 0)
 
-            if method == "POST" and "parse-receipt" in path_only:
-                ok = status == 200
+            if method == "POST" and PARSE_PATH in path_only:
                 totals["uploads"] += 1
-                totals["receiptsParsed" if ok else "failedParses"] += 1
                 uploads.append(
                     {
                         "at": _iso(ts),
+                        "_ts": ts,
+                        "_job": _job_id(path_only),
                         "visitor": visitors[key],
                         "device": device,
-                        "ok": ok,
-                        "outcome": OUTCOMES.get(status, "error %d" % status),
                         "status": status,
                         "seconds": round(float(entry.get("duration") or 0), 1),
                         "photoKB": _upload_kb(entry, req),
                     }
                 )
+            elif method == "GET" and PARSE_PATH in path_only:
+                # A phone asking how its parse is going, about once a second.
+                totals["progressChecks"] += 1
+                job = _job_id(path_only)
+                if not job:
+                    continue
+                seen = checks.setdefault(job, {"last": ts, "failure": None})
+                seen["last"] = max(seen["last"], ts)
+                if status >= 400:
+                    seen["failure"] = status
             elif method == "GET" and path_only.startswith("/pay/"):
                 # Someone opening the link they were sent.
                 totals["payLinkOpens"] += 1
@@ -163,6 +199,11 @@ def summarise(paths) -> dict:
                 # An extensionless GET is the SPA loading, not an asset.
                 if "." not in path_only.rsplit("/", 1)[-1]:
                     totals["pageViews"] += 1
+
+    for row in uploads:
+        _decide(row, checks.get(row.pop("_job") or "\0"))
+        totals["receiptsParsed" if row["ok"] else "failedParses"] += 1
+        row.pop("_ts", None)
 
     totals["visitors"] = len(visitors)
     uploads.sort(key=lambda u: u["at"], reverse=True)
@@ -173,6 +214,37 @@ def summarise(paths) -> dict:
         "totals": totals,
         "uploads": uploads,
     }
+
+
+def _decide(row: dict, seen: dict | None) -> None:
+    """Turn an upload plus its progress checks into one outcome.
+
+    The upload's own status decides it outright when the photo never got as
+    far as a job. Otherwise the checks do, and their last timestamp is how
+    long the person actually waited — the upload's own duration is now just
+    how long it took to hand the photo over.
+    """
+    status = row["status"]
+    outcome = UPLOAD_OUTCOMES.get(status, "error %d" % status)
+    if outcome is not None:
+        row["outcome"] = outcome
+        row["ok"] = status in (200, 202)
+        return
+
+    if seen is None:
+        # Accepted, and then nobody ever asked how it went.
+        row["outcome"] = "not collected"
+        row["ok"] = False
+        return
+
+    waited = round(seen["last"] - row["_ts"], 1)
+    if waited >= 0:
+        row["seconds"] = waited
+    failure = seen["failure"]
+    row["outcome"] = (
+        "parsed" if failure is None else CHECK_OUTCOMES.get(failure, "error %d" % failure)
+    )
+    row["ok"] = failure is None
 
 
 # One report per worker, refreshed at most every STATS_CACHE_S. The log is a
@@ -206,7 +278,6 @@ def _photo(kb) -> str:
 
 
 def _row(u: dict) -> str:
-    photo = _photo(u["photoKB"])
     return (
         '<tr class="%s">' % ("ok" if u["ok"] else "bad")
         + "<td>%s</td>" % u["at"][:16].replace("T", " ")
@@ -214,7 +285,7 @@ def _row(u: dict) -> str:
         + "<td>%s</td>" % u["device"]
         + "<td>%s</td>" % u["outcome"]
         + "<td>%s</td>" % u["seconds"]
-        + "<td>%s</td>" % photo
+        + "<td>%s</td>" % _photo(u["photoKB"])
         + "</tr>"
     )
 
@@ -249,14 +320,16 @@ def render_html(report: dict) -> str:
         "tr.bad td{background:#fff6f6}div{overflow-x:auto}p{color:#666}</style>"
         "<h2>Every receipt put through SplitToWin</h2>"
         "<p>" + head + "</p><div><table><tr><th>when</th><th>who</th>"
-        "<th>device</th><th>outcome</th><th>secs</th><th>photo</th></tr>"
+        "<th>device</th><th>outcome</th><th>waited</th><th>photo</th></tr>"
         + rows
         + "</table></div>"
-        "<p>One row per upload, newest first. &ldquo;Who&rdquo; is a visitor "
-        "number, not a person: the same number means the same device and "
-        "address came back. The receipt itself never reaches the server, so "
-        "what is on it cannot be shown here.</p>"
+        "<p>One row per upload, newest first. &ldquo;Waited&rdquo; is how long "
+        "the phone was asking before it got an answer. &ldquo;Who&rdquo; is a "
+        "visitor number, not a person: the same number means the same device "
+        "and address came back. The receipt itself never reaches the server, "
+        "so what is on it cannot be shown here.</p>"
         "<p>Times in SGT. Generated "
         + report["generatedAt"][:19].replace("T", " ")
-        + " from %d log file(s).</p>" % report["logFiles"]
+        + " from %d log file(s), plus %d progress check(s) not shown as rows.</p>"
+        % (report["logFiles"], t["progressChecks"])
     )

@@ -87,6 +87,11 @@ class Job:
         elif self.status == FAILED:
             out["error"] = getattr(self.error, "message", None) or "Couldn't read that receipt."
             out["code"] = getattr(self.error, "code", "parse_failed")
+            # Carried out to the route, which answers with it rather than
+            # 200 so the failure is visible in the access log — the only
+            # place /stats can learn that a background job went wrong. The
+            # route takes it back off the body before sending.
+            out["httpStatus"] = getattr(self.error, "status", 502)
         return out
 
 

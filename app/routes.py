@@ -87,10 +87,15 @@ def stats():
 
 
 @api.post("/parse-receipt")
-def parse_receipt():
+@api.post("/parse-receipt/<path_job_id>")
+def parse_receipt(path_job_id: str = ""):
     """Take the photo, start reading it, and answer immediately with a job id.
 
     The response is 202, never the receipt: the caller polls for the result.
+
+    The id belongs in the path so that the access log, which is all /stats has
+    to work with, can tie an upload to the progress checks that followed it.
+    Without that the log sees an accepted upload and never learns how it went.
     """
     if _rate_limited(_client_ip()):
         return (
@@ -133,7 +138,11 @@ def parse_receipt():
     # Phones drop the connection when backgrounded, so the client reuses its
     # job id. The same id arriving twice attaches to the parse already
     # running instead of reading the same receipt a second time.
-    job_id = (request.form.get("jobId") or "").strip()[:64] or uuid.uuid4().hex
+    job_id = (
+        (path_job_id or "").strip()[:64]
+        or (request.form.get("jobId") or "").strip()[:64]
+        or uuid.uuid4().hex
+    )
     mime = upload.mimetype or "image/jpeg"
 
     def work(report):
@@ -158,9 +167,10 @@ def parse_receipt():
 def parse_progress(job_id: str):
     """How that parse is going. Polled about once a second while it runs.
 
-    A finished-but-failed job is still a successful poll, so the failure
-    travels in the body rather than as an HTTP error the client has to
-    unpick. Only "I have never heard of this job" is a 404.
+    A failed parse answers with the failure's own status code, not 200. The
+    body is the same either way and the client reads the outcome from it, but
+    the code is what puts the failure in the access log, which is the only
+    place /stats can learn that a background job went wrong.
     """
     job = jobs.get((job_id or "").strip()[:64])
     if job is None:
@@ -173,7 +183,11 @@ def parse_progress(job_id: str):
             ),
             404,
         )
-    return jsonify(job.snapshot())
+    snapshot = job.snapshot()
+    # Taken off the body: it is how this reply is coded, not something the
+    # client needs to read.
+    code = snapshot.pop("httpStatus", 200)
+    return jsonify(snapshot), code
 
 
 @api.app_errorhandler(413)
