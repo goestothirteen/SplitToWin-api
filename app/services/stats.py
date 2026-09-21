@@ -135,6 +135,7 @@ def summarise(paths) -> dict:
         "uploads": 0,
         "receiptsParsed": 0,
         "failedParses": 0,
+        "outcomeUnknown": 0,
         "progressChecks": 0,
         "pageViews": 0,
         "payLinkOpens": 0,
@@ -201,8 +202,12 @@ def summarise(paths) -> dict:
                     totals["pageViews"] += 1
 
     for row in uploads:
-        _decide(row, checks.get(row.pop("_job") or "\0"))
-        totals["receiptsParsed" if row["ok"] else "failedParses"] += 1
+        job = row.pop("_job")
+        _decide(row, checks.get(job) if job else None, tracked=bool(job))
+        if row["ok"] is None:
+            totals["outcomeUnknown"] += 1
+        else:
+            totals["receiptsParsed" if row["ok"] else "failedParses"] += 1
         row.pop("_ts", None)
 
     totals["visitors"] = len(visitors)
@@ -216,13 +221,18 @@ def summarise(paths) -> dict:
     }
 
 
-def _decide(row: dict, seen: dict | None) -> None:
+def _decide(row: dict, seen: dict | None, tracked: bool = True) -> None:
     """Turn an upload plus its progress checks into one outcome.
 
     The upload's own status decides it outright when the photo never got as
     far as a job. Otherwise the checks do, and their last timestamp is how
     long the person actually waited — the upload's own duration is now just
     how long it took to hand the photo over.
+
+    `ok` is None where the log cannot honestly say. Those rows are counted
+    apart from both the successes and the failures rather than guessed into
+    one of them: an unknown rounded to a number is worse than an unknown
+    that admits it.
     """
     status = row["status"]
     outcome = UPLOAD_OUTCOMES.get(status, "error %d" % status)
@@ -231,10 +241,18 @@ def _decide(row: dict, seen: dict | None) -> None:
         row["ok"] = status in (200, 202)
         return
 
+    if not tracked:
+        # An upload from before the job id travelled in the path. It was
+        # accepted; nothing in the log ties it to how it ended.
+        row["outcome"] = "accepted, outcome not logged"
+        row["ok"] = None
+        return
+
     if seen is None:
-        # Accepted, and then nobody ever asked how it went.
+        # Accepted, and then nobody ever asked how it went. The parse may
+        # well have succeeded; the person was not there to receive it.
         row["outcome"] = "not collected"
-        row["ok"] = False
+        row["ok"] = None
         return
 
     waited = round(seen["last"] - row["_ts"], 1)
@@ -279,7 +297,8 @@ def _photo(kb) -> str:
 
 def _row(u: dict) -> str:
     return (
-        '<tr class="%s">' % ("ok" if u["ok"] else "bad")
+        '<tr class="%s">'
+        % ("unknown" if u["ok"] is None else "ok" if u["ok"] else "bad")
         + "<td>%s</td>" % u["at"][:16].replace("T", " ")
         + "<td>#%d</td>" % u["visitor"]
         + "<td>%s</td>" % u["device"]
@@ -299,6 +318,7 @@ def render_html(report: dict) -> str:
             "%d receipt%s uploaded" % (t["uploads"], "" if t["uploads"] == 1 else "s"),
             "%d parsed" % t["receiptsParsed"],
             "%d failed" % t["failedParses"],
+            "%d unknown" % t["outcomeUnknown"],
             "%d visitor%s" % (t["visitors"], "" if t["visitors"] == 1 else "s"),
             "%d page view%s" % (t["pageViews"], "" if t["pageViews"] == 1 else "s"),
             "%d pay link%s opened" % (t["payLinkOpens"], "" if t["payLinkOpens"] == 1 else "s"),
@@ -317,6 +337,7 @@ def render_html(report: dict) -> str:
         "table{border-collapse:collapse;width:100%}th,td{padding:.4rem .5rem;"
         "text-align:left;border-bottom:1px solid #ddd;white-space:nowrap}"
         "th{font-weight:600}tr.bad td:nth-child(4){color:#b00020}"
+        "tr.unknown td{color:#8a8a8a}"
         "tr.bad td{background:#fff6f6}div{overflow-x:auto}p{color:#666}</style>"
         "<h2>Every receipt put through SplitToWin</h2>"
         "<p>" + head + "</p><div><table><tr><th>when</th><th>who</th>"

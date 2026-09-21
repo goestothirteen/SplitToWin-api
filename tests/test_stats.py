@@ -111,18 +111,37 @@ class SummariseTest(unittest.TestCase):
         self.assertEqual(totals["uploads"], 4)
         self.assertEqual(totals["receiptsParsed"], 2)
         self.assertEqual(totals["failedParses"], 2)  # the 422 and the old 429
+        self.assertEqual(totals["outcomeUnknown"], 0)
         self.assertEqual(totals["progressChecks"], 18)  # 12 + 6, never rows
         self.assertEqual(totals["pageViews"], 4)
         self.assertEqual(totals["payLinkOpens"], 1)
         self.assertEqual(totals["botHits"], 1)
 
-    def test_an_upload_nobody_ever_checked_on_is_said_to_be_uncollected(self):
+    def test_an_upload_nobody_ever_checked_on_is_neither_a_pass_nor_a_fail(self):
+        """The parse may well have succeeded; the person just wasn't there to
+        receive it. Counting it either way would be a guess."""
         with open(os.path.join(self.tmp.name, "split2win.log"), "a") as f:
             f.write(line(T0 + 600, "7.7.7.7", ANDROID, "POST",
                          "/api/parse-receipt/zzz", 202, 0.3) + "\n")
-        row = self.report()["uploads"][0]
+        report = self.report()
+        row = report["uploads"][0]
         self.assertEqual(row["outcome"], "not collected")
-        self.assertFalse(row["ok"])
+        self.assertIsNone(row["ok"])
+        self.assertEqual(report["totals"]["outcomeUnknown"], 1)
+        self.assertEqual(report["totals"]["failedParses"], 2)  # unchanged
+
+    def test_an_upload_from_before_job_ids_admits_it_cannot_say(self):
+        """Lines already in the log posted to the bare path, so nothing ties
+        them to the checks that followed. They were accepted; that is all
+        that can honestly be claimed."""
+        with open(os.path.join(self.tmp.name, "split2win.log"), "a") as f:
+            f.write(line(T0 + 650, "7.7.7.7", ANDROID, "POST",
+                         "/api/parse-receipt", 202, 0.3) + "\n")
+        report = self.report()
+        row = report["uploads"][0]
+        self.assertEqual(row["outcome"], "accepted, outcome not logged")
+        self.assertIsNone(row["ok"])
+        self.assertEqual(report["totals"]["outcomeUnknown"], 1)
 
     def test_a_job_the_server_forgot_reads_as_expired_not_as_a_bad_receipt(self):
         with open(os.path.join(self.tmp.name, "split2win.log"), "a") as f:
@@ -197,6 +216,7 @@ class EndpointTest(unittest.TestCase):
         self.assertIn("4 receipts uploaded", body)
         self.assertIn("not a usable receipt", body)
         self.assertIn("progress check", body)
+        self.assertIn("0 unknown", body)
         self.assertNotIn("1.1.1.1", body)
 
 
