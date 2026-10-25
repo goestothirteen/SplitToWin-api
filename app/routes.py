@@ -14,12 +14,13 @@ import time
 import uuid
 from collections import defaultdict, deque
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, current_app, jsonify, request, send_file
 
 from .config import Config
+from .services.archive import store as archive
 from .services.jobs import store as jobs
 from .services.receipt_parser import active_providers, parse_receipt_image
-from .services.stats import access_log_report, render_html
+from .services.stats import access_log_report, render_html, with_archive
 
 log = logging.getLogger(__name__)
 
@@ -74,16 +75,55 @@ def healthz():
 def stats():
     """How the app has been used: one row per receipt uploaded.
 
-    Deliberately an open URL. A row is counts, a device class and a visitor
-    number — no addresses, and nothing off the receipt itself, which never
-    reaches the server — so there is nothing on it worth the friction of a
-    login. A browser gets a table; curl and scripts get the JSON behind it.
+    Deliberately an open URL, by the owner's choice: this is a personal app
+    used among friends, and a login would be more friction than the page is
+    worth. Each row is what the access log saw — device class, visitor
+    number, outcome — joined with what the archive kept: the names the bill
+    was split between, its total, and a link to a small copy of the photo.
+    A browser gets a table; curl and scripts get the JSON behind it.
     """
     report = access_log_report(Config.ACCESS_LOG_GLOB, Config.STATS_CACHE_S)
+    report = with_archive(
+        report,
+        archive.by_job(),
+        photo_url=lambda job: "%s/stats/photo/%s" % (Config.API_PUBLIC_PREFIX, job),
+    )
     wants = request.accept_mimetypes.best_match(["application/json", "text/html"])
     if wants == "text/html":
         return render_html(report), 200, {"Content-Type": "text/html; charset=utf-8"}
     return jsonify(report)
+
+
+@api.get("/stats/photo/<job_id>")
+def stats_photo(job_id: str):
+    """The small copy of one receipt photo."""
+    job_id = (job_id or "").strip()
+    if not archive.has_photo(job_id):
+        return jsonify({"error": "No photo kept for that upload.", "code": "not_found"}), 404
+    return send_file(
+        archive.photo_path(job_id),
+        mimetype="image/jpeg",
+        max_age=3600,
+        conditional=True,
+    )
+
+
+@api.post("/parse-receipt/<job_id>/people")
+def record_people(job_id: str):
+    """The names at the table, sent by the phone whenever they change.
+
+    Idempotent and small: the latest list replaces the last. Only an upload
+    the archive has a row for is accepted, so the id has to come from a real
+    parse. The phone fires this and forgets — a failure here must never be
+    something the person at the table sees.
+    """
+    body = request.get_json(silent=True)
+    names = body.get("names") if isinstance(body, dict) else None
+    if not isinstance(names, list):
+        return jsonify({"error": "Send {\"names\": [...]}.", "code": "bad_request"}), 400
+    if not archive.record_people((job_id or "").strip()[:64], names):
+        return jsonify({"error": "Unknown upload.", "code": "job_unknown"}), 404
+    return "", 204
 
 
 @api.post("/parse-receipt")
@@ -147,6 +187,10 @@ def parse_receipt(path_job_id: str = ""):
 
     def work(report):
         started = time.monotonic()
+        # Kept before the parse, so a photo the reader then refuses is still
+        # on record as having been sent. This is on the worker thread: the
+        # 202 has already gone back to the phone.
+        archive.record_upload(job_id, raw)
         parsed = parse_receipt_image(raw, mime, report)
         log.info(
             "parsed receipt items=%d bytes=%d ms=%d job=%s",
@@ -155,7 +199,9 @@ def parse_receipt(path_job_id: str = ""):
             int((time.monotonic() - started) * 1000),
             job_id,
         )
-        return parsed.to_dict()
+        result = parsed.to_dict()
+        archive.record_parsed(job_id, result)
+        return result
 
     job, is_new = jobs.start(job_id, work)
     if not is_new:

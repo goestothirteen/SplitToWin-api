@@ -88,6 +88,16 @@ class Config:
     # re-read the log for every hit.
     STATS_CACHE_S = _int("STATS_CACHE_S", 30)
 
+    # Where each receipt's photo, total and the names it was split between
+    # are kept (services/archive.py). Compose mounts a host directory here so
+    # the store outlives the container. Empty switches the archive off.
+    ARCHIVE_DIR = os.environ.get("ARCHIVE_DIR", os.path.join(os.getcwd(), "data")).strip()
+
+    # What the outside world puts in front of this API's paths. Caddy strips
+    # it before proxying, so the API only needs it to write a photo URL that
+    # a script reading the JSON can follow.
+    API_PUBLIC_PREFIX = os.environ.get("API_PUBLIC_PREFIX", "/api").rstrip("/")
+
     @classmethod
     def missing(cls) -> list[str]:
         """Config problems that make receipt parsing impossible."""

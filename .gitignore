@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 node_modules/
+# The receipt archive (photos + sqlite) a local run writes; see ARCHIVE_DIR.
+data/

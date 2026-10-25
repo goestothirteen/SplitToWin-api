@@ -81,6 +81,15 @@ class ParseTestBase(unittest.TestCase):
         import app.routes as routes
 
         routes.jobs = jobs.store
+        # A throwaway archive, so a test run never writes photos into the
+        # real data directory.
+        import tempfile
+
+        from app.services import archive
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_archive = routes.archive
+        routes.archive = archive.Archive(self._tmp.name)
 
     def tearDown(self):
         receipt_parser.providers.resolve_chain = self._real_chain
@@ -88,6 +97,8 @@ class ParseTestBase(unittest.TestCase):
         import app.routes as routes
 
         routes.jobs = self._real_store
+        routes.archive = self._real_archive
+        self._tmp.cleanup()
 
     def upload(self, photo=None):
         response = self.client.post(

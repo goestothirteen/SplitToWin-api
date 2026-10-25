@@ -203,6 +203,9 @@ def summarise(paths) -> dict:
 
     for row in uploads:
         job = row.pop("_job")
+        # Kept on the row: it is what joins this upload to the archive's
+        # copy of the photo and the names it was split between.
+        row["job"] = job or None
         _decide(row, checks.get(job) if job else None, tracked=bool(job))
         if row["ok"] is None:
             totals["outcomeUnknown"] += 1
@@ -288,6 +291,38 @@ def access_log_report(pattern: str, max_age_s: int) -> dict:
         return report
 
 
+def with_archive(report: dict, records: dict, *, photo_url) -> dict:
+    """Join what the archive kept onto the log's rows, without touching the
+    cached report: the rows are copied, because the same report is handed
+    to the next caller.
+
+    Every row gains `people` (the names, or null where nothing was recorded
+    — an upload from before the archive existed), `total`, `currency` and
+    `photo` (a URL, or null where no copy was kept).
+    """
+    rows = []
+    matched = 0
+    for u in report["uploads"]:
+        row = dict(u)
+        rec = records.get(row.get("job") or "")
+        if rec is not None:
+            matched += 1
+        row["people"] = rec["people"] if rec is not None else None
+        row["total"] = rec["total"] if rec is not None else None
+        row["currency"] = rec["currency"] if rec is not None else ""
+        row["photo"] = photo_url(row["job"]) if rec is not None and rec["photo"] else None
+        rows.append(row)
+
+    out = dict(report)
+    out["uploads"] = rows
+    out["archive"] = {
+        "receipts": len(records),
+        "withNames": sum(1 for r in records.values() if r["people"]),
+        "matchedToLog": matched,
+    }
+    return out
+
+
 def _photo(kb) -> str:
     """Phone photos are a couple of MB; KB past a thousand is hard to read."""
     if kb is None:
@@ -295,16 +330,51 @@ def _photo(kb) -> str:
     return "%d KB" % kb if kb < 1024 else "%.1f MB" % (kb / 1024)
 
 
-def _row(u: dict) -> str:
+def _esc(text) -> str:
+    """Names come off a phone keyboard, so they are text, never markup."""
     return (
-        '<tr class="%s">'
-        % ("unknown" if u["ok"] is None else "ok" if u["ok"] else "bad")
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _money(u: dict) -> str:
+    if u.get("total") is None:
+        return ""
+    return ("%s %.2f" % (u.get("currency") or "", u["total"])).strip()
+
+
+def _people(u: dict) -> str:
+    names = u.get("people")
+    if names is None:
+        return '<span class=dim>&ndash;</span>'
+    if not names:
+        return '<span class=dim>none added</span>'
+    return _esc(", ".join(names))
+
+
+def _row(u: dict) -> str:
+    if u.get("photo"):
+        # Relative to /stats, so it works under whatever prefix the proxy
+        # puts in front of the API.
+        photo = '<a href="stats/photo/%s" target=_blank>%s</a>' % (
+            u["job"], _photo(u["photoKB"]) or "photo"
+        )
+    else:
+        photo = _photo(u["photoKB"])
+    return (
+        '<tr class="%s">' % ("unknown" if u["ok"] is None else "ok" if u["ok"] else "bad")
         + "<td>%s</td>" % u["at"][:16].replace("T", " ")
         + "<td>#%d</td>" % u["visitor"]
         + "<td>%s</td>" % u["device"]
         + "<td>%s</td>" % u["outcome"]
         + "<td>%s</td>" % u["seconds"]
-        + "<td>%s</td>" % _photo(u["photoKB"])
+        + "<td>%s</td>" % _people(u)
+        + "<td>%s</td>" % _money(u)
+        + "<td>%s</td>" % photo
         + "</tr>"
     )
 
@@ -313,6 +383,7 @@ def render_html(report: dict) -> str:
     """A phone-readable table, newest upload first. Browsers ask for
     text/html; everything else gets the JSON, so the same URL serves both."""
     t = report["totals"]
+    arch = report.get("archive") or {}
     head = " &middot; ".join(
         (
             "%d receipt%s uploaded" % (t["uploads"], "" if t["uploads"] == 1 else "s"),
@@ -326,8 +397,22 @@ def render_html(report: dict) -> str:
             "%d request%s" % (t["requests"], "" if t["requests"] == 1 else "s"),
         )
     )
+    if arch.get("receipts") is not None:
+        head += " &middot; %d on file, %d with names" % (
+            arch["receipts"], arch.get("withNames", 0)
+        )
+    columns = ["when", "who", "device", "outcome", "waited", "split with", "total", "photo"]
     rows = "".join(_row(u) for u in report["uploads"]) or (
-        '<tr><td colspan="6">No receipts have been uploaded yet.</td></tr>'
+        '<tr><td colspan="%d">No receipts have been uploaded yet.</td></tr>' % len(columns)
+    )
+    about = (
+        "<p>One row per upload, newest first. &ldquo;Waited&rdquo; is how long "
+        "the phone was asking before it got an answer. &ldquo;Who&rdquo; is a "
+        "visitor number, not a person: the same number means the same device "
+        "and address came back. &ldquo;Split with&rdquo; is the names typed in "
+        "on the phone, as they last stood; a dash means that upload is from "
+        "before names were kept. The photo link opens the small copy the "
+        "server kept.</p>"
     )
     return (
         "<!doctype html><meta charset=utf-8>"
@@ -337,19 +422,17 @@ def render_html(report: dict) -> str:
         "table{border-collapse:collapse;width:100%}th,td{padding:.4rem .5rem;"
         "text-align:left;border-bottom:1px solid #ddd;white-space:nowrap}"
         "th{font-weight:600}tr.bad td:nth-child(4){color:#b00020}"
-        "tr.unknown td{color:#8a8a8a}"
+        "tr.unknown td{color:#8a8a8a}.dim{color:#8a8a8a}"
+        "td:nth-child(6){white-space:normal;min-width:10rem}"
         "tr.bad td{background:#fff6f6}div{overflow-x:auto}p{color:#666}</style>"
         "<h2>Every receipt put through SplitToWin</h2>"
-        "<p>" + head + "</p><div><table><tr><th>when</th><th>who</th>"
-        "<th>device</th><th>outcome</th><th>waited</th><th>photo</th></tr>"
+        "<p>" + head + "</p><div><table><tr>"
+        + "".join("<th>%s</th>" % c for c in columns)
+        + "</tr>"
         + rows
         + "</table></div>"
-        "<p>One row per upload, newest first. &ldquo;Waited&rdquo; is how long "
-        "the phone was asking before it got an answer. &ldquo;Who&rdquo; is a "
-        "visitor number, not a person: the same number means the same device "
-        "and address came back. The receipt itself never reaches the server, "
-        "so what is on it cannot be shown here.</p>"
-        "<p>Times in SGT. Generated "
+        + about
+        + "<p>Times in SGT. Generated "
         + report["generatedAt"][:19].replace("T", " ")
         + " from %d log file(s), plus %d progress check(s) not shown as rows.</p>"
         % (report["logFiles"], t["progressChecks"])
