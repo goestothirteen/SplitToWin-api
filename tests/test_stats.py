@@ -49,6 +49,12 @@ def write_logs(dirpath):
     ]
     live += upload_and_checks(T0 + 30, "1.1.1.1", IPHONE, "aaa", 12)
     live += upload_and_checks(T0 + 90, "1.1.1.1", IPHONE, "bbb", 6, 422)
+    # The phone sending the names for the first receipt, twice as they
+    # changed. Not uploads, and a 204 is not an error.
+    live += [
+        line(T0 + 50, "1.1.1.1", IPHONE, "POST", "/api/parse-receipt/aaa/people", 204),
+        line(T0 + 55, "1.1.1.1", IPHONE, "POST", "/api/parse-receipt/aaa/people", 204),
+    ]
     live += [
         line(T0 + 100, "1.1.1.1", IPHONE, "GET", "/split"),
         line(T0 + 200, "2.2.2.2", ANDROID, "GET", "/"),  # looked, left: no upload
@@ -113,6 +119,8 @@ class SummariseTest(unittest.TestCase):
         self.assertEqual(totals["failedParses"], 2)  # the 422 and the old 429
         self.assertEqual(totals["outcomeUnknown"], 0)
         self.assertEqual(totals["progressChecks"], 18)  # 12 + 6, never rows
+        self.assertEqual(totals["nameUpdates"], 2)  # never rows either
+        self.assertNotIn("error 204", [u["outcome"] for u in self.report()["uploads"]])
         self.assertEqual(totals["pageViews"], 4)
         self.assertEqual(totals["payLinkOpens"], 1)
         self.assertEqual(totals["botHits"], 1)

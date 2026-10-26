@@ -110,7 +110,7 @@ def stats_photo(job_id: str):
 
 @api.post("/parse-receipt/<job_id>/people")
 def record_people(job_id: str):
-    """The names at the table, sent by the phone whenever they change.
+    """The names at the table, sent when the phone goes on to split the bill.
 
     Idempotent and small: the latest list replaces the last. Only an upload
     the archive has a row for is accepted, so the id has to come from a real

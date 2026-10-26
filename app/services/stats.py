@@ -137,6 +137,7 @@ def summarise(paths) -> dict:
         "failedParses": 0,
         "outcomeUnknown": 0,
         "progressChecks": 0,
+        "nameUpdates": 0,
         "pageViews": 0,
         "payLinkOpens": 0,
         "botHits": 0,
@@ -169,7 +170,11 @@ def summarise(paths) -> dict:
             method = req.get("method", "")
             status = entry.get("status", 0)
 
-            if method == "POST" and PARSE_PATH in path_only:
+            if method == "POST" and path_only.endswith("/people"):
+                # The phone saying who the bill is for. Not an upload, and
+                # its 204 is not an error — it was being read as both.
+                totals["nameUpdates"] += 1
+            elif method == "POST" and PARSE_PATH in path_only:
                 totals["uploads"] += 1
                 uploads.append(
                     {
